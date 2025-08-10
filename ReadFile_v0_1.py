@@ -454,6 +454,61 @@ def get_doc_types():
             "message": str(e)
         }), 500
 
+# %%
+@app.route('/auth/authorize', methods=['POST'])
+def authorize_user():
+    try:
+        payload = request.get_json(silent=True) or {}
+        email = payload.get('email')
+        if not email:
+            return jsonify({"status": "error", "message": "Missing email"}), 400
+
+        conn = get_mysql_connection()
+        with conn.cursor() as cursor:
+            # Match your provided schema: famis_db.users(id, email, role, is_approved, created_at)
+            cursor.execute(
+                """
+                SELECT id        AS UserID,
+                       email     AS Email,
+                       role      AS Role,
+                       is_approved AS IsApproved
+                FROM users
+                WHERE LOWER(email) = LOWER(%s)
+                LIMIT 1
+                """,
+                (email,)
+            )
+            row = cursor.fetchone()
+        conn.close()
+
+        if not row:
+            return jsonify({
+                "status": "pending",
+                "message": "Your account is not authorized yet. Please contact administrator.",
+            }), 403
+
+        # Require approval and non-pending role
+        is_approved = bool(row.get("IsApproved"))
+        role = (row.get("Role") or "").lower()
+
+        if not is_approved or role == "pending":
+            return jsonify({
+                "status": "pending",
+                "message": "Your account is pending approval.",
+            }), 403
+
+        return jsonify({
+            "status": "success",
+            "user": {
+                "user_id": row.get("UserID"),
+                "email": row.get("Email"),
+                "role": role
+            }
+        }), 200
+
+    except Exception as e:
+        return jsonify({"status": "error", "message": str(e)}), 500
+
 # %% [markdown]
 # ## POST method for process file
 
