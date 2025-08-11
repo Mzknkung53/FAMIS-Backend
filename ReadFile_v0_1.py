@@ -78,7 +78,7 @@ POPPLER_PATH = r"C:/Users/Ned/Desktop/Poppler/poppler-24.08.0/Library/bin"
 
 # %%
 app = Flask(__name__)
-CORS(app, resources={r"/*": {"origins": "http://localhost:5173"}})
+CORS(app, resources={r"/*": {"origins": ["http://localhost:5173","http://127.0.0.1:5173","http://localhost:3000","http://127.0.0.1:3000"]}})
 job_store = {}
 completed_unconfirmed_tasks = {}
 
@@ -454,6 +454,96 @@ def get_doc_types():
             "message": str(e)
         }), 500
 
+# %% Admin users management
+@app.route('/admin/users', methods=['GET'])
+def admin_list_users():
+    try:
+        conn = get_mysql_connection()
+        with conn.cursor() as cursor:
+            cursor.execute(
+                """
+                SELECT id   AS id,
+                       email AS email,
+                       role  AS role,
+                       is_approved AS isApproved
+                FROM users
+                ORDER BY id ASC
+                """
+            )
+            rows = cursor.fetchall()
+        conn.close()
+        # Department column not in schema → return null for now
+        users = [
+            {
+                "id": r["id"],
+                "email": r["email"],
+                "role": r["role"],
+                "department": None,
+                "is_approved": bool(r["isApproved"]) if r.get("isApproved") is not None else None,
+            }
+            for r in rows
+        ]
+        return jsonify({"users": users})
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+
+@app.route('/admin/users', methods=['POST'])
+def admin_create_user():
+    try:
+        payload = request.get_json(silent=True) or {}
+        email = payload.get('email')
+        role = (payload.get('role') or 'staff').lower()
+        if role not in ('admin', 'staff', 'pending'):
+            role = 'staff'
+        if not email:
+            return jsonify({"error": "email required"}), 400
+
+        conn = get_mysql_connection()
+        with conn.cursor() as cursor:
+            cursor.execute(
+                "INSERT INTO users (email, role, is_approved) VALUES (%s, %s, %s)",
+                (email, role, 1)
+            )
+            new_id = cursor.lastrowid
+        conn.commit()
+        conn.close()
+        return jsonify({"id": new_id}), 201
+    except pymysql.err.IntegrityError:
+        return jsonify({"error": "duplicate email"}), 409
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+
+@app.route('/admin/users/<int:user_id>/role', methods=['PATCH'])
+def admin_change_role(user_id: int):
+    try:
+        payload = request.get_json(silent=True) or {}
+        role = (payload.get('role') or '').lower()
+        if role not in ('admin', 'staff', 'pending'):
+            return jsonify({"error": "invalid role"}), 400
+        conn = get_mysql_connection()
+        with conn.cursor() as cursor:
+            cursor.execute("UPDATE users SET role=%s WHERE id=%s", (role, user_id))
+        conn.commit()
+        conn.close()
+        return jsonify({"status": "ok"})
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+
+@app.route('/admin/users/<int:user_id>', methods=['DELETE'])
+def admin_delete_user(user_id: int):
+    try:
+        conn = get_mysql_connection()
+        with conn.cursor() as cursor:
+            cursor.execute("DELETE FROM users WHERE id=%s", (user_id,))
+        conn.commit()
+        conn.close()
+        return jsonify({"status": "ok"})
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
 # %%
 @app.route('/auth/authorize', methods=['POST'])
 def authorize_user():
@@ -755,6 +845,54 @@ def save_extracted_data():
     except Exception as e:
         print("❌ Error saving to MySQL:", e)
         return jsonify({"status": "error", "message": "Failed to store data."}), 500
+
+# %%
+@app.route('/access/check', methods=['POST'])
+def check_access():
+    try:
+        payload = request.get_json(silent=True) or {}
+        email = payload.get('email')
+        if not email:
+            return jsonify({"status": "error", "message": "Missing email"}), 400
+
+        conn = get_mysql_connection()
+        with conn.cursor() as cursor:
+            cursor.execute(
+                """
+                SELECT id        AS UserID,
+                       email     AS Email,
+                       role      AS Role,
+                       is_approved AS IsApproved
+                FROM users
+                WHERE LOWER(email) = LOWER(%s)
+                LIMIT 1
+                """,
+                (email,)
+            )
+            row = cursor.fetchone()
+        conn.close()
+
+        if not row:
+            return jsonify({"status": "denied", "message": "User not found"}), 403
+
+        is_approved = bool(row.get("IsApproved"))
+        role = (row.get("Role") or "").lower()
+
+        if not is_approved or role == "pending":
+            return jsonify({"status": "pending", "message": "User pending approval"}), 403
+
+        return jsonify({
+            "status": "success",
+            "user": {
+                "user_id": row.get("UserID"),
+                "email": row.get("Email"),
+                "role": row.get("Role"),
+            }
+        })
+
+    except Exception as e:
+        return jsonify({"status": "error", "message": str(e)}), 500
+
 
 # %%
 if __name__ == "__main__":
