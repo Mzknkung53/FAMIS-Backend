@@ -465,6 +465,7 @@ def admin_list_users():
                 SELECT id   AS id,
                        email AS email,
                        role  AS role,
+                       department AS department,
                        is_approved AS isApproved
                 FROM users
                 ORDER BY id ASC
@@ -472,13 +473,13 @@ def admin_list_users():
             )
             rows = cursor.fetchall()
         conn.close()
-        # Department column not in schema → return null for now
         users = [
             {
                 "id": r["id"],
                 "email": r["email"],
                 "role": r["role"],
-                "department": None,
+                # Default department to "Student" when empty or not provided
+                "department": (r.get("department") or "Student"),
                 "is_approved": bool(r["isApproved"]) if r.get("isApproved") is not None else None,
             }
             for r in rows
@@ -494,6 +495,7 @@ def admin_create_user():
         payload = request.get_json(silent=True) or {}
         email = payload.get('email')
         role = (payload.get('role') or 'staff').lower()
+        department = (payload.get('department') or 'Student')
         if role not in ('admin', 'staff', 'pending'):
             role = 'staff'
         if not email:
@@ -502,8 +504,8 @@ def admin_create_user():
         conn = get_mysql_connection()
         with conn.cursor() as cursor:
             cursor.execute(
-                "INSERT INTO users (email, role, is_approved) VALUES (%s, %s, %s)",
-                (email, role, 1)
+                "INSERT INTO users (email, role, department, is_approved) VALUES (%s, %s, %s, %s)",
+                (email, role, department, 1)
             )
             new_id = cursor.lastrowid
         conn.commit()
@@ -550,6 +552,7 @@ def authorize_user():
     try:
         payload = request.get_json(silent=True) or {}
         email = payload.get('email')
+        incoming_department = (payload.get('department') or None)
         if not email:
             return jsonify({"status": "error", "message": "Missing email"}), 400
 
@@ -561,6 +564,7 @@ def authorize_user():
                 SELECT id        AS UserID,
                        email     AS Email,
                        role      AS Role,
+                       department AS Department,
                        is_approved AS IsApproved
                 FROM users
                 WHERE LOWER(email) = LOWER(%s)
@@ -580,6 +584,7 @@ def authorize_user():
         # Require approval and non-pending role
         is_approved = bool(row.get("IsApproved"))
         role = (row.get("Role") or "").lower()
+        current_department = row.get("Department")
 
         if not is_approved or role == "pending":
             return jsonify({
@@ -587,12 +592,25 @@ def authorize_user():
                 "message": "Your account is pending approval.",
             }), 403
 
+        # If a department was provided from client and it's different/missing, persist it
+        if incoming_department and (incoming_department != current_department):
+            conn = get_mysql_connection()
+            with conn.cursor() as cursor:
+                cursor.execute(
+                    "UPDATE users SET department=%s WHERE LOWER(email)=LOWER(%s)",
+                    (incoming_department, email)
+                )
+            conn.commit()
+            conn.close()
+            current_department = incoming_department
+
         return jsonify({
             "status": "success",
             "user": {
                 "user_id": row.get("UserID"),
                 "email": row.get("Email"),
-                "role": role
+                "role": role,
+                "department": current_department or "Student",
             }
         }), 200
 
