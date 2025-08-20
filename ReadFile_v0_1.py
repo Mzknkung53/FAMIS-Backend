@@ -790,41 +790,136 @@ def save_extracted_data():
         return jsonify({"status": "error", "message": "Invalid payload"}), 400
 
     user_id         = payload.get("user_id")
+    user_email      = payload.get("email")
     filename        = payload.get("filename")
     image_path      = payload.get("image_path")
     structured_data = payload.get("structured_data")
     task_id         = payload.get("task_id")
 
-    if not (user_id and filename and image_path and isinstance(structured_data, list)):
+    # Allow frontend to send structured_data as JSON string or list
+    if isinstance(structured_data, str):
+        try:
+            structured_data = json.loads(structured_data)
+        except Exception:
+            return jsonify({"status": "error", "message": "structured_data must be JSON array"}), 400
+
+    if not (filename and image_path and isinstance(structured_data, list)):
         return jsonify({"status": "error", "message": "Missing or invalid keys"}), 400
 
+    print(f"/save: payload -> user_id={user_id}, email={user_email}, filename={filename}")
+
+    # Resolve and verify uploader from users table
     try:
         conn = get_mysql_connection()
         with conn.cursor() as cursor:
+            resolved = None
+            if user_email:
+                cursor.execute(
+                    """
+                    SELECT id, email, role, is_approved
+                    FROM users
+                    WHERE LOWER(email)=LOWER(%s)
+                    LIMIT 1
+                    """,
+                    (user_email,)
+                )
+                resolved = cursor.fetchone()
+            elif user_id:
+                cursor.execute(
+                    "SELECT id, email, role, is_approved FROM users WHERE id=%s LIMIT 1",
+                    (user_id,)
+                )
+                resolved = cursor.fetchone()
 
+        conn.close()
+        if not resolved:
+            return jsonify({"status": "error", "message": "Uploader not found"}), 400
+        if not bool(resolved.get("is_approved")):
+            return jsonify({"status": "error", "message": "Uploader not approved"}), 403
+        if (resolved.get("role") or "").lower() not in ("staff", "admin"):
+            return jsonify({"status": "error", "message": "Uploader role not allowed"}), 403
 
-            # SQL for insert data -> ExtractedData
+        if user_id and user_email and int(user_id) != int(resolved.get("id")):
+            return jsonify({"status": "error", "message": "Uploader mismatch"}), 400
+
+        uploader_id = int(resolved.get("id"))
+        print(f"/save: verified uploader -> id={uploader_id}, email={resolved.get('email')}, role={resolved.get('role')}")
+    except Exception as e:
+        return jsonify({"status": "error", "message": f"Uploader verification failed: {e}"}), 500
+
+    try:
+        # Decode data URI and save to uploads/; compute size
+        saved_file_path = None
+        file_size_bytes = None
+        try:
+            if isinstance(image_path, str) and image_path.startswith("data:") and "," in image_path:
+                header, b64data = image_path.split(",", 1)
+                decoded = base64.b64decode(b64data)
+                file_size_bytes = len(decoded)
+
+                uploads_dir = os.path.join(os.getcwd(), "uploads")
+                os.makedirs(uploads_dir, exist_ok=True)
+                # make a unique filename to avoid collisions
+                safe_name = (filename or "file").replace("/", "_").replace("\\", "_")
+                unique_name = f"{uuid.uuid4().hex}_{safe_name}"
+                abs_path = os.path.join(uploads_dir, unique_name)
+                with open(abs_path, "wb") as f:
+                    f.write(decoded)
+                # store as short relative path for UI/database
+                saved_file_path = f"/uploads/{unique_name}"
+            else:
+                # assume it's already a server path
+                saved_file_path = image_path
+        except Exception as e:
+            print("❌ Failed to decode/save uploaded file:", e)
+            return jsonify({"status": "error", "message": "Invalid image_path; expected data URI"}), 400
+
+        # Determine file extension (non-null)
+        file_ext = None
+        if isinstance(filename, str) and "." in filename:
+            file_ext = filename.rsplit(".", 1)[-1].lower()
+        if not file_ext:
+            file_ext = "bin"
+
+        conn = get_mysql_connection()
+        with conn.cursor() as cursor:
+            # 1) Insert into uploadfiles referencing users.id via uploaded_by
+            insert_upload_sql = """
+                INSERT INTO uploadfiles
+                (uploaded_by, reviewed_by, FileName, FileFormat, FileSize, UploadDatetime, FilePath, OCRText, UploadStatus)
+                VALUES (%s, %s, %s, %s, %s, NOW(), %s, %s, %s)
+            """
+            cursor.execute(
+                insert_upload_sql,
+                (
+                    uploader_id,             # uploaded_by -> verified users.id
+                    None,                     # reviewed_by
+                    filename,
+                    file_ext,
+                    file_size_bytes or 0,     # FileSize cannot be NULL
+                    saved_file_path or "",
+                    None,                     # OCRText (optional)
+                    "pending"                # UploadStatus
+                )
+            )
+            file_id = cursor.lastrowid
+            print(f"/save: created uploadfiles row -> FileID={file_id}, uploaded_by={uploader_id}")
+
+            # 2) Insert extracted pages into ExtractedData using the real file_id
             insert_data_sql = """
                 INSERT INTO ExtractedData
                 (PageNumber, BillNumber, DocTypeID, SupplierName, Amount, PaymentDate, Signature, FileID, FilePath)
                 VALUES (%s, %s, %s,        %s,           %s,     %s,          %s,        %s,       %s)
             """
 
-            # ----- Use mock data -------
-            file_id = 1
-            # ---------------------------
-
             values = []
             for doc in structured_data:
                 raw_amt = doc.get("amount")
-
-                # String -> Float
                 try:
                     amt_val = float(str(raw_amt).replace(",", "")) if raw_amt else None
                 except ValueError:
                     amt_val = None
 
-                # Find DocTypeID from document type name
                 doc_type_id = resolve_doc_type_id(doc.get("document_type"))
                 if doc_type_id is None:
                     doc_type_id = None
@@ -838,7 +933,7 @@ def save_extracted_data():
                     doc.get("payment_date"),
                     doc.get("signature"),
                     file_id,
-                    image_path
+                    saved_file_path
                 ))
 
             if values:
@@ -855,7 +950,8 @@ def save_extracted_data():
             "file_id": file_id,
             "filename": filename,
             "page_count": len(structured_data),
-            "preview_data": structured_data[:2]
+            "preview_data": structured_data[:2],
+            "uploader_id": uploader_id
         }
 
         return jsonify({"status": "success", "preview": preview}), 200
@@ -863,6 +959,93 @@ def save_extracted_data():
     except Exception as e:
         print("❌ Error saving to MySQL:", e)
         return jsonify({"status": "error", "message": "Failed to store data."}), 500
+
+
+# %%
+@app.route('/admin/uploads/pending', methods=['GET'])
+def list_pending_uploads():
+    try:
+        conn = get_mysql_connection()
+        with conn.cursor() as cursor:
+            cursor.execute(
+                """
+                SELECT uf.FileID           AS file_id,
+                       uf.FileName         AS file_name,
+                       uf.UploadDatetime   AS uploaded_at,
+                       uf.UploadStatus     AS status,
+                       uf.uploaded_by      AS uploaded_by,
+                       u.email             AS uploader_email,
+                       u.department        AS uploader_department
+                FROM UploadFiles uf
+                LEFT JOIN users u ON u.id = uf.uploaded_by
+                WHERE uf.UploadStatus = 'pending'
+                ORDER BY uf.UploadDatetime DESC
+                """
+            )
+            rows = cursor.fetchall()
+        conn.close()
+        return jsonify({"status": "success", "uploads": rows})
+    except Exception as e:
+        return jsonify({"status": "error", "message": str(e)}), 500
+
+
+# %%
+@app.route('/uploads/by-user', methods=['POST'])
+def list_uploads_by_user():
+    try:
+        payload = request.get_json(silent=True) or {}
+        user_id = payload.get('user_id')
+        user_email = payload.get('email')
+
+        # Resolve user similarly to /save
+        conn = get_mysql_connection()
+        with conn.cursor() as cursor:
+            resolved = None
+            if user_email:
+                cursor.execute(
+                    """
+                    SELECT id, email, role, is_approved
+                    FROM users
+                    WHERE LOWER(email)=LOWER(%s)
+                    LIMIT 1
+                    """,
+                    (user_email,)
+                )
+                resolved = cursor.fetchone()
+            elif user_id:
+                cursor.execute(
+                    "SELECT id, email, role, is_approved FROM users WHERE id=%s LIMIT 1",
+                    (user_id,)
+                )
+                resolved = cursor.fetchone()
+        if not resolved:
+            conn.close()
+            return jsonify({"status": "error", "message": "User not found"}), 404
+
+        resolved_id = int(resolved.get('id'))
+
+        with conn.cursor() as cursor:
+            cursor.execute(
+                """
+                SELECT FileID         AS file_id,
+                       FileName       AS file_name,
+                       FileFormat     AS file_format,
+                       FileSize       AS file_size,
+                       UploadDatetime AS uploaded_at,
+                       UploadStatus   AS status,
+                       FilePath       AS file_path
+                FROM uploadfiles
+                WHERE uploaded_by = %s
+                ORDER BY UploadDatetime DESC
+                """,
+                (resolved_id,)
+            )
+            rows = cursor.fetchall()
+        conn.close()
+
+        return jsonify({"status": "success", "uploads": rows})
+    except Exception as e:
+        return jsonify({"status": "error", "message": str(e)}), 500
 
 # %%
 @app.route('/access/check', methods=['POST'])
