@@ -23,7 +23,7 @@ from flask import jsonify
 
 from threading import Thread
 import uuid, traceback
-from datetime import datetime
+from datetime import datetime, timezone
 import base64
 
 # %% [markdown]
@@ -48,7 +48,7 @@ assert MYSQL_PASSWORD, "Cannot find MYSQL_PASSWORD in .env"
 print("MySQL Settings Loaded")
 
 def get_mysql_connection():
-    return pymysql.connect(
+    conn = pymysql.connect(
         host=MYSQL_HOST,
         port=MYSQL_PORT,
         user=MYSQL_USER,
@@ -57,6 +57,13 @@ def get_mysql_connection():
         charset="utf8mb4",
         cursorclass=DictCursor
     )
+    # Ensure session is UTC for deterministic timestamps
+    try:
+        with conn.cursor() as cursor:
+            cursor.execute("SET time_zone = '+00:00'")
+    except Exception:
+        pass
+    return conn
 client = OpenAI(
     api_key=api_key
 )
@@ -348,7 +355,7 @@ def background_process(task_id, file_bytes, filename):
         job_store[task_id] = {
             "status": "processing",
             "message": f"{filename} is being processed.",
-            "timestamp": datetime.now().isoformat()
+            "timestamp": datetime.now(timezone.utc).strftime('%Y-%m-%dT%H:%M:%SZ')
         }
 
         temp_dir = tempfile.gettempdir()
@@ -364,7 +371,7 @@ def background_process(task_id, file_bytes, filename):
             job_store[task_id] = {
                 "status": "error",
                 "message": result["message"],
-                "timestamp": datetime.now().isoformat()
+                "timestamp": datetime.now(timezone.utc).strftime('%Y-%m-%dT%H:%M:%SZ')
             }
             print(f"---- Upload and validation done for {filename} ----")
             return
@@ -406,7 +413,7 @@ def background_process(task_id, file_bytes, filename):
         job_store[task_id] = {
             "status": "complete",
             "message": f"{filename} is successfully processed. Please confirm the information.",
-            "timestamp": datetime.now().isoformat(),
+            "timestamp": datetime.now(timezone.utc).strftime('%Y-%m-%dT%H:%M:%SZ'),
             "result": interpreted_data,
             "file_base64": encoded_pdf,
             "filename": filename
@@ -420,7 +427,7 @@ def background_process(task_id, file_bytes, filename):
         job_store[task_id] = {
             "status": "error",
             "message": f"Server error: {str(e)}",
-            "timestamp": datetime.now().isoformat()
+            "timestamp": datetime.now(timezone.utc).strftime('%Y-%m-%dT%H:%M:%SZ')
         }
         print(f"---- Exception in background_process: {e} ----")
 
@@ -971,7 +978,7 @@ def list_pending_uploads():
                 """
                 SELECT uf.FileID           AS file_id,
                        uf.FileName         AS file_name,
-                       uf.UploadDatetime   AS uploaded_at,
+                       DATE_FORMAT(CONVERT_TZ(uf.UploadDatetime, @@session.time_zone, '+00:00'), '%%Y-%%m-%%dT%%H:%%i:%%sZ') AS uploaded_at,
                        uf.UploadStatus     AS status,
                        uf.uploaded_by      AS uploaded_by,
                        u.email             AS uploader_email,
@@ -1031,7 +1038,7 @@ def list_uploads_by_user():
                        FileName       AS file_name,
                        FileFormat     AS file_format,
                        FileSize       AS file_size,
-                       UploadDatetime AS uploaded_at,
+                       DATE_FORMAT(CONVERT_TZ(UploadDatetime, @@session.time_zone, '+00:00'), '%%Y-%%m-%%dT%%H:%%i:%%sZ') AS uploaded_at,
                        UploadStatus   AS status,
                        FilePath       AS file_path
                 FROM uploadfiles
@@ -1044,6 +1051,37 @@ def list_uploads_by_user():
         conn.close()
 
         return jsonify({"status": "success", "uploads": rows})
+    except Exception as e:
+        return jsonify({"status": "error", "message": str(e)}), 500
+
+
+# %%
+@app.route('/uploads/<int:file_id>/extracted', methods=['GET'])
+def get_extracted_by_file(file_id: int):
+    try:
+        conn = get_mysql_connection()
+        with conn.cursor() as cursor:
+            cursor.execute(
+                """
+                SELECT ed.DataID       AS data_id,
+                       ed.PageNumber   AS page,
+                       ed.BillNumber   AS bill_number,
+                       ed.SupplierName AS supplier_name,
+                       ed.Amount       AS amount,
+                       ed.PaymentDate  AS payment_date,
+                       ed.Signature    AS signature,
+                       ed.DocTypeID    AS doc_type_id,
+                       dt.DocTypeName  AS doc_type_name
+                FROM ExtractedData ed
+                LEFT JOIN DocType dt ON dt.DocTypeID = ed.DocTypeID
+                WHERE ed.FileID = %s
+                ORDER BY ed.PageNumber ASC
+                """,
+                (file_id,)
+            )
+            rows = cursor.fetchall()
+        conn.close()
+        return jsonify({"status": "success", "items": rows})
     except Exception as e:
         return jsonify({"status": "error", "message": str(e)}), 500
 
