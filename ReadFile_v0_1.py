@@ -996,6 +996,88 @@ def list_pending_uploads():
         return jsonify({"status": "error", "message": str(e)}), 500
 
 
+# %% Admin approve/reject uploads
+@app.route('/admin/uploads/<int:file_id>/approve', methods=['POST'])
+def approve_upload(file_id: int):
+    try:
+        payload = request.get_json(silent=True) or {}
+        reviewer_email = payload.get('reviewer_email')
+        reviewer_id = payload.get('reviewer_id')
+
+        conn = get_mysql_connection()
+        with conn.cursor() as cursor:
+            # Resolve reviewer_id from email if provided
+            if reviewer_id is None and reviewer_email:
+                cursor.execute("SELECT id FROM users WHERE LOWER(email)=LOWER(%s) LIMIT 1", (reviewer_email,))
+                row = cursor.fetchone()
+                reviewer_id = int(row['id']) if row else None
+
+            cursor.execute(
+                """
+                UPDATE UploadFiles
+                SET UploadStatus = 'approved',
+                    RejectReason = NULL,
+                    reviewed_by = COALESCE(%s, reviewed_by)
+                WHERE FileID = %s
+                """,
+                (reviewer_id, file_id)
+            )
+            # Insert review log
+            cursor.execute(
+                """
+                INSERT INTO upload_review_logs (file_id, action, reason, reviewer_id, created_at)
+                VALUES (%s, 'approved', NULL, %s, NOW())
+                """,
+                (file_id, reviewer_id)
+            )
+        conn.commit()
+        conn.close()
+        return jsonify({"status": "success"})
+    except Exception as e:
+        return jsonify({"status": "error", "message": str(e)}), 500
+
+
+@app.route('/admin/uploads/<int:file_id>/reject', methods=['POST'])
+def reject_upload(file_id: int):
+    try:
+        payload = request.get_json(silent=True) or {}
+        reason = payload.get('reason')
+        reviewer_email = payload.get('reviewer_email')
+        reviewer_id = payload.get('reviewer_id')
+
+        conn = get_mysql_connection()
+        with conn.cursor() as cursor:
+            # Resolve reviewer_id
+            if reviewer_id is None and reviewer_email:
+                cursor.execute("SELECT id FROM users WHERE LOWER(email)=LOWER(%s) LIMIT 1", (reviewer_email,))
+                row = cursor.fetchone()
+                reviewer_id = int(row['id']) if row else None
+
+            cursor.execute(
+                """
+                UPDATE UploadFiles
+                SET UploadStatus = 'rejected',
+                    RejectReason = %s,
+                    reviewed_by = COALESCE(%s, reviewed_by)
+                WHERE FileID = %s
+                """,
+                (reason, reviewer_id, file_id)
+            )
+            # Insert review log
+            cursor.execute(
+                """
+                INSERT INTO upload_review_logs (file_id, action, reason, reviewer_id, created_at)
+                VALUES (%s, 'rejected', %s, %s, NOW())
+                """,
+                (file_id, reason, reviewer_id)
+            )
+        conn.commit()
+        conn.close()
+        return jsonify({"status": "success"})
+    except Exception as e:
+        return jsonify({"status": "error", "message": str(e)}), 500
+
+
 # %%
 @app.route('/uploads/by-user', methods=['POST'])
 def list_uploads_by_user():
@@ -1040,7 +1122,8 @@ def list_uploads_by_user():
                        FileSize       AS file_size,
                        DATE_FORMAT(CONVERT_TZ(UploadDatetime, @@session.time_zone, '+00:00'), '%%Y-%%m-%%dT%%H:%%i:%%sZ') AS uploaded_at,
                        UploadStatus   AS status,
-                       FilePath       AS file_path
+                       FilePath       AS file_path,
+                       RejectReason   AS reject_reason
                 FROM uploadfiles
                 WHERE uploaded_by = %s
                 ORDER BY UploadDatetime DESC
