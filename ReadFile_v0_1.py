@@ -25,6 +25,9 @@ from threading import Thread
 import uuid, traceback
 from datetime import datetime, timezone
 import base64
+from flask import send_from_directory, abort
+import os
+
 
 # %% [markdown]
 # #### API key
@@ -667,7 +670,7 @@ def get_task_status(task_id):
             "message": job["message"],
             "timestamp": job["timestamp"],
             "result": job["result"],
-            #"file_base64": job["file_base64"],
+            "file_base64": job["file_base64"],
             "filename": job["filename"]
         })
 
@@ -974,25 +977,24 @@ def list_pending_uploads():
     try:
         conn = get_mysql_connection()
         with conn.cursor() as cursor:
-            cursor.execute(
-                """
-                SELECT uf.FileID           AS file_id,
-                       uf.FileName         AS file_name,
-                       DATE_FORMAT(CONVERT_TZ(uf.UploadDatetime, @@session.time_zone, '+00:00'), '%%Y-%%m-%%dT%%H:%%i:%%sZ') AS uploaded_at,
-                       uf.UploadStatus     AS status,
-                       uf.uploaded_by      AS uploaded_by,
-                       u.email             AS uploader_email,
-                       u.department        AS uploader_department
-                FROM UploadFiles uf
-                LEFT JOIN users u ON u.id = uf.uploaded_by
-                WHERE uf.UploadStatus = 'pending'
-                ORDER BY uf.UploadDatetime DESC
-                """
-            )
+            cursor.execute("""
+                            SELECT uf.FileID           AS file_id,
+                                   uf.FileName         AS file_name,
+                                   DATE_FORMAT(CONVERT_TZ(uf.UploadDatetime, @@session.time_zone, '+00:00'), '%Y-%m-%dT%H:%i:%sZ') AS uploaded_at,
+                                   uf.UploadStatus     AS status,
+                                   uf.uploaded_by      AS uploaded_by,
+                                   u.email             AS uploader_email,
+                                   u.department        AS uploader_department
+                            FROM UploadFiles uf
+                            LEFT JOIN users u ON u.id = uf.uploaded_by
+                            WHERE uf.UploadStatus = 'pending'
+                            ORDER BY uf.UploadDatetime DESC
+                        """)
             rows = cursor.fetchall()
         conn.close()
         return jsonify({"status": "success", "uploads": rows})
     except Exception as e:
+        traceback.print_exc()
         return jsonify({"status": "error", "message": str(e)}), 500
 
 
@@ -1154,9 +1156,11 @@ def get_extracted_by_file(file_id: int):
                        ed.PaymentDate  AS payment_date,
                        ed.Signature    AS signature,
                        ed.DocTypeID    AS doc_type_id,
-                       dt.DocTypeName  AS doc_type_name
+                       dt.DocTypeName  AS doc_type_name,
+                       uf.FilePath     AS file_path
                 FROM ExtractedData ed
-                LEFT JOIN DocType dt ON dt.DocTypeID = ed.DocTypeID
+                LEFT JOIN DocType dt     ON dt.DocTypeID = ed.DocTypeID
+                LEFT JOIN uploadfiles uf ON uf.FileID    = ed.FileID
                 WHERE ed.FileID = %s
                 ORDER BY ed.PageNumber ASC
                 """,
@@ -1164,9 +1168,34 @@ def get_extracted_by_file(file_id: int):
             )
             rows = cursor.fetchall()
         conn.close()
+
+        if rows and rows[0].get("file_path"):
+            import os
+            from flask import request
+
+            file_name = os.path.basename(rows[0]["file_path"])
+            file_url = request.host_url.rstrip("/") + "/uploads/" + file_name
+
+            for r in rows:
+                r["file_url"] = file_url
+
         return jsonify({"status": "success", "items": rows})
+
     except Exception as e:
         return jsonify({"status": "error", "message": str(e)}), 500
+
+@app.route("/uploads/<path:filename>")
+def serve_uploaded_file(filename):
+    uploads_dir = os.path.join(os.getcwd(), "uploads")
+
+    safe_path = os.path.normpath(os.path.join(uploads_dir, filename))
+    if not safe_path.startswith(uploads_dir):
+        abort(403)
+
+    if not os.path.exists(safe_path):
+        abort(404)
+
+    return send_from_directory(uploads_dir, filename)
 
 # %%
 @app.route('/access/check', methods=['POST'])
