@@ -352,7 +352,7 @@ def classify_document_type(structured_data: dict) -> str:
         return 'Unknown'
 
 # %%
-def background_process(task_id, file_bytes, filename):
+def background_process(task_id, file_bytes, filename, user_id=None, user_email=None):
     try:
 
         job_store[task_id] = {
@@ -378,6 +378,75 @@ def background_process(task_id, file_bytes, filename):
             }
             print(f"---- Upload and validation done for {filename} ----")
             return
+
+        # Resolve uploader id if provided
+        uploader_id = None
+        try:
+            conn = get_mysql_connection()
+            with conn.cursor() as cursor:
+                if user_email:
+                    cursor.execute(
+                        """
+                        SELECT id FROM users
+                        WHERE LOWER(email)=LOWER(%s)
+                        LIMIT 1
+                        """,
+                        (user_email,)
+                    )
+                    row = cursor.fetchone()
+                    uploader_id = int(row['id']) if row else None
+                if uploader_id is None and user_id:
+                    cursor.execute("SELECT id FROM users WHERE id=%s LIMIT 1", (user_id,))
+                    row = cursor.fetchone()
+                    uploader_id = int(row['id']) if row else None
+        finally:
+            try:
+                conn.close()
+            except Exception:
+                pass
+
+        # Save permanent copy and create UploadFiles row (pending)
+        uploads_dir = os.path.join(os.getcwd(), "uploads")
+        os.makedirs(uploads_dir, exist_ok=True)
+        safe_name = (filename or "file").replace("/", "_").replace("\\", "_")
+        unique_name = f"{uuid.uuid4().hex}_{safe_name}"
+        abs_saved_path = os.path.join(uploads_dir, unique_name)
+        with open(abs_saved_path, "wb") as outf:
+            outf.write(file_bytes)
+        saved_file_path = f"/uploads/{unique_name}"
+        file_size_bytes = os.path.getsize(abs_saved_path)
+        file_ext = filename.rsplit('.', 1)[-1].lower() if '.' in filename else 'bin'
+
+        # Require a known uploader to satisfy NOT NULL uploaded_by.
+        if not uploader_id:
+            job_store[task_id] = {
+                "status": "error",
+                "message": "Uploader not resolved. Please login and try again.",
+                "timestamp": datetime.now(timezone.utc).strftime('%Y-%m-%dT%H:%M:%SZ')
+            }
+            return
+
+        try:
+            conn = get_mysql_connection()
+            with conn.cursor() as cursor:
+                cursor.execute(
+                    """
+                    INSERT INTO uploadfiles
+                    (uploaded_by, reviewed_by, FileName, FileFormat, FileSize, UploadDatetime, FilePath, OCRText, UploadStatus)
+                    VALUES (%s, %s, %s, %s, %s, NOW(), %s, %s, %s)
+                    """,
+                    (
+                        uploader_id, None, filename, file_ext, file_size_bytes,
+                        saved_file_path, None, 'pending'
+                    )
+                )
+                file_id = cursor.lastrowid
+            conn.commit()
+        finally:
+            try:
+                conn.close()
+            except Exception:
+                pass
 
         # 2. Read_Text_From_File (OCR)
         ocr_text = read_text_from_file(save_path)
@@ -412,6 +481,87 @@ def background_process(task_id, file_bytes, filename):
         for page_data in interpreted_data:
             classified_type = classify_document_type(page_data)
             page_data["document_type"] = classified_type
+
+        # Helper to parse Thai date text -> ISO date string
+        def parse_thai_date(date_text: str) -> str | None:
+            if not date_text:
+                return None
+            try:
+                months = {
+                    'มกราคม': 1, 'กุมภาพันธ์': 2, 'มีนาคม': 3, 'เมษายน': 4, 'พฤษภาคม': 5, 'มิถุนายน': 6,
+                    'กรกฎาคม': 7, 'สิงหาคม': 8, 'กันยายน': 9, 'ตุลาคม': 10, 'พฤศจิกายน': 11, 'ธันวาคม': 12
+                }
+                parts = str(date_text).strip().split()
+                if len(parts) >= 3:
+                    day = int(parts[0])
+                    month = months.get(parts[1], None)
+                    year = int(parts[2])
+                    if year > 2400:
+                        year -= 543
+                    if month:
+                        return f"{year:04d}-{month:02d}-{day:02d}"
+                return None
+            except Exception:
+                return None
+
+        # 5. Upsert into StagedExtractedData
+        try:
+            conn = get_mysql_connection()
+            with conn.cursor() as cursor:
+                insert_sql = (
+                    """
+                    INSERT INTO StagedExtractedData
+                    (FileID, PageNumber, BillNumber, SupplierName, Amount, PaymentDate, PaymentDateText, Signature, DocTypeID, FilePath, RawText, CreatedBy)
+                    VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
+                    ON DUPLICATE KEY UPDATE
+                      BillNumber=VALUES(BillNumber),
+                      SupplierName=VALUES(SupplierName),
+                      Amount=VALUES(Amount),
+                      PaymentDate=VALUES(PaymentDate),
+                      PaymentDateText=VALUES(PaymentDateText),
+                      Signature=VALUES(Signature),
+                      DocTypeID=VALUES(DocTypeID),
+                      FilePath=VALUES(FilePath),
+                      RawText=VALUES(RawText),
+                      UpdatedAt=NOW(),
+                      Version=Version+1
+                    """
+                )
+
+                for doc in interpreted_data:
+                    raw_amt = doc.get("amount")
+                    try:
+                        amt_val = float(str(raw_amt).replace(",", "")) if raw_amt else None
+                    except ValueError:
+                        amt_val = None
+
+                    doc_type_id = resolve_doc_type_id(doc.get("document_type"))
+                    pay_text = doc.get("payment_date")
+                    pay_date = parse_thai_date(pay_text)
+
+                    cursor.execute(
+                        insert_sql,
+                        (
+                            file_id,
+                            int(doc.get("page") or 1),
+                            doc.get("bill_number"),
+                            doc.get("supplier_name"),
+                            amt_val,
+                            pay_date,
+                            pay_text,
+                            doc.get("signature"),
+                            doc_type_id,
+                            saved_file_path,
+                            doc.get("raw_text"),
+                            uploader_id or None,
+                        )
+                    )
+            conn.commit()
+        finally:
+            try:
+                conn.close()
+            except Exception:
+                pass
 
         job_store[task_id] = {
             "status": "complete",
@@ -644,10 +794,12 @@ def process_file():
         return jsonify({"status": "error", "message": "No selected file"}), 400
 
     file_bytes = file.read()
+    user_email = request.form.get("email")
+    user_id = request.form.get("user_id")
     task_id = str(uuid.uuid4())
     job_store[task_id] = {"status": "processing"}
 
-    thread = Thread(target=background_process, args=(task_id, file_bytes, file.filename))
+    thread = Thread(target=background_process, args=(task_id, file_bytes, file.filename, user_id, user_email))
     thread.start()
 
     print(f">>> Started background thread with task_id: {task_id}")
@@ -1146,6 +1298,7 @@ def get_extracted_by_file(file_id: int):
     try:
         conn = get_mysql_connection()
         with conn.cursor() as cursor:
+            # Try approved data first
             cursor.execute(
                 """
                 SELECT ed.DataID       AS data_id,
@@ -1167,6 +1320,29 @@ def get_extracted_by_file(file_id: int):
                 (file_id,)
             )
             rows = cursor.fetchall()
+
+            # If no approved rows, return staged rows for review
+            if not rows:
+                cursor.execute(
+                    """
+                    SELECT NULL             AS data_id,
+                           s.PageNumber     AS page,
+                           s.BillNumber     AS bill_number,
+                           s.SupplierName   AS supplier_name,
+                           s.Amount         AS amount,
+                           s.PaymentDate    AS payment_date,
+                           s.Signature      AS signature,
+                           s.DocTypeID      AS doc_type_id,
+                           dt.DocTypeName   AS doc_type_name,
+                           s.FilePath       AS file_path
+                    FROM StagedExtractedData s
+                    LEFT JOIN DocType dt ON dt.DocTypeID = s.DocTypeID
+                    WHERE s.FileID = %s
+                    ORDER BY s.PageNumber ASC
+                    """,
+                    (file_id,)
+                )
+                rows = cursor.fetchall()
         conn.close()
 
         if rows and rows[0].get("file_path"):
