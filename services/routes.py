@@ -632,6 +632,36 @@ def create_app() -> Flask:
         except Exception as e:
             return jsonify({"status": "error", "message": str(e)}), 500
 
+    @app.route('/admin/uploads/archive', methods=['GET'])
+    def list_archived_uploads():
+        try:
+            conn = get_mysql_connection()
+            with conn.cursor() as cursor:
+                cursor.execute(
+                    """
+                    SELECT uf.FileID           AS file_id,
+                           uf.FileName         AS file_name,
+                           DATE_FORMAT(CONVERT_TZ(uf.UploadDatetime, @@session.time_zone, '+00:00'), '%Y-%m-%dT%H:%i:%sZ') AS uploaded_at,
+                           uf.UploadStatus     AS status,
+                           uf.reviewed_by      AS reviewed_by,
+                           u_rev.email         AS reviewer_email,
+                           u_rev.department    AS reviewer_department,
+                           u_up.email          AS uploader_email,
+                           u_up.department     AS uploader_department
+                    FROM UploadFiles uf
+                    LEFT JOIN users u_rev ON u_rev.id = uf.reviewed_by
+                    LEFT JOIN users u_up  ON u_up.id  = uf.uploaded_by
+                    WHERE uf.UploadStatus IN ('approved','rejected')
+                    ORDER BY uf.UploadDatetime DESC
+                    """
+                )
+                rows = cursor.fetchall()
+            conn.close()
+            return jsonify({"status": "success", "uploads": rows})
+        except Exception as e:
+            traceback.print_exc()
+            return jsonify({"status": "error", "message": str(e)}), 500
+
     @app.route('/uploads/by-user', methods=['POST'])
     def list_uploads_by_user():
         try:
