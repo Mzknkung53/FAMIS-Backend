@@ -38,9 +38,18 @@ def create_app() -> Flask:
     @app.route('/admin/users', methods=['GET'])
     def admin_list_users():
         try:
+            # Demo error/unauthorized toggles for testing
+            if request.headers.get('X-Demo-Force-Unauthorized') == '1':
+                return jsonify({"status": "error", "message": "Unauthorized access."}), 403
+            if request.headers.get('X-Demo-Force-DbError') == '1':
+                return jsonify({"status": "error", "message": "Unable to retrieve user list from database. Please try again later."}), 500
+
+            role_filter = (request.args.get('role') or '').strip().lower()
+            page_param = request.args.get('page')
+
             conn = get_mysql_connection()
             with conn.cursor() as cursor:
-                cursor.execute(
+                base_sql = (
                     """
                     SELECT id   AS id,
                            email AS email,
@@ -48,11 +57,17 @@ def create_app() -> Flask:
                            department AS department,
                            is_approved AS isApproved
                     FROM users
-                    ORDER BY id ASC
                     """
                 )
+                params = []
+                if role_filter in ('admin','staff','pending'):
+                    base_sql += " WHERE role=%s"
+                    params.append(role_filter)
+                base_sql += " ORDER BY id ASC"
+                cursor.execute(base_sql, params)
                 rows = cursor.fetchall()
             conn.close()
+
             users = [
                 {
                     "id": r["id"],
@@ -63,22 +78,37 @@ def create_app() -> Flask:
                 }
                 for r in rows
             ]
-            return jsonify({"users": users})
-        except Exception as e:
-            return jsonify({"error": str(e)}), 500
+
+            if request.headers.get('X-Demo-Force-Empty') == '1':
+                users = []
+
+            resp = {"status": "success", "users": users}
+            if page_param is not None:
+                try:
+                    resp["page"] = [int(page_param)]
+                except Exception:
+                    resp["page"] = [page_param]
+            return jsonify(resp)
+        except Exception:
+            return jsonify({"status": "error", "message": "Unable to retrieve user list from database. Please try again later."}), 500
 
     @app.route('/admin/users', methods=['POST'])
     def admin_create_user():
         import pymysql
         try:
+            if request.headers.get('X-Demo-Force-DbError') == '1':
+                return jsonify({"status": "error", "message": "Unable to store data due to server error. Please try again later."}), 500
+
             payload = request.get_json(silent=True) or {}
-            email = payload.get('email')
+            email = (payload.get('email') or '').strip()
             role = (payload.get('role') or 'staff').lower()
             department = (payload.get('department') or 'Student')
+            if not email:
+                return jsonify({"status": "error", "message": "email required"}), 400
+            if not email.endswith('@cmu.ac.th'):
+                return jsonify({"status": "error", "message": "Invalid email format. Must end with @cmu.ac.th."}), 400
             if role not in ('admin', 'staff', 'pending'):
                 role = 'staff'
-            if not email:
-                return jsonify({"error": "email required"}), 400
 
             conn = get_mysql_connection()
             with conn.cursor() as cursor:
@@ -89,39 +119,68 @@ def create_app() -> Flask:
                 new_id = cursor.lastrowid
             conn.commit()
             conn.close()
-            return jsonify({"id": new_id}), 201
+            return jsonify({"status": "success", "message": "The email and role has been stored in the database", "id": new_id}), 201
         except pymysql.err.IntegrityError:
-            return jsonify({"error": "duplicate email"}), 409
-        except Exception as e:
-            return jsonify({"error": str(e)}), 500
+            return jsonify({"status": "error", "message": "This email is already registered."}), 409
+        except Exception:
+            return jsonify({"status": "error", "message": "Unable to store data due to server error. Please try again later."}), 500
 
     @app.route('/admin/users/<int:user_id>/role', methods=['PATCH'])
     def admin_change_role(user_id: int):
         try:
+            if request.headers.get('X-Demo-Force-Unauthorized') == '1':
+                return jsonify({"status": "error", "message": "Unauthorized access."}), 403
+            if request.headers.get('X-Demo-Force-DbError') == '1':
+                return jsonify({"status": "error", "message": "Unable to update user role due to server error. Please try again later."}), 500
+
             payload = request.get_json(silent=True) or {}
             role = (payload.get('role') or '').lower()
             if role not in ('admin', 'staff', 'pending'):
-                return jsonify({"error": "invalid role"}), 400
+                return jsonify({"status": "error", "message": "Invalid role specified."}), 400
             conn = get_mysql_connection()
             with conn.cursor() as cursor:
+                cursor.execute("SELECT id FROM users WHERE id=%s LIMIT 1", (user_id,))
+                exists = cursor.fetchone()
+                if not exists:
+                    conn.close()
+                    return jsonify({"status": "error", "message": "Selected user cannot be found. Please refresh the list and try again."}), 404
                 cursor.execute("UPDATE users SET role=%s WHERE id=%s", (role, user_id))
             conn.commit()
             conn.close()
+
+            if request.headers.get('X-Demo-Force-EmailFail') == '1':
+                return jsonify({
+                    "status": "partial_success",
+                    "user_id": user_id,
+                    "new_role": role,
+                    "message": "Role updated, but failed to send notification email."
+                })
+
             return jsonify({"status": "ok"})
-        except Exception as e:
-            return jsonify({"error": str(e)}), 500
+        except Exception:
+            return jsonify({"status": "error", "message": "Unable to update user role due to server error. Please try again later."}), 500
 
     @app.route('/admin/users/<int:user_id>', methods=['DELETE'])
     def admin_delete_user(user_id: int):
         try:
+            if request.headers.get('X-Demo-Force-Unauthorized') == '1':
+                return jsonify({"status": "error", "message": "Unauthorized access."}), 403
+            if request.headers.get('X-Demo-Force-DbError') == '1':
+                return jsonify({"status": "error", "message": "Unable to delete user due to server error. Please try again later."}), 500
+
             conn = get_mysql_connection()
             with conn.cursor() as cursor:
+                cursor.execute("SELECT id FROM users WHERE id=%s LIMIT 1", (user_id,))
+                found = cursor.fetchone()
+                if not found:
+                    conn.close()
+                    return jsonify({"status": "error", "message": "Selected user cannot be found."}), 404
                 cursor.execute("DELETE FROM users WHERE id=%s", (user_id,))
             conn.commit()
             conn.close()
             return jsonify({"status": "ok"})
-        except Exception as e:
-            return jsonify({"error": str(e)}), 500
+        except Exception:
+            return jsonify({"status": "error", "message": "Unable to delete user due to server error. Please try again later."}), 500
 
     @app.route('/auth/authorize', methods=['POST'])
     def authorize_user():
