@@ -185,8 +185,8 @@ def create_app() -> Flask:
                         if a and a.get('email'):
                             actor_email = a.get('email')
                     # Direct notification to affected user
-                    notify_title = 'อัปเดตสิทธิ์ผู้ใช้'
-                    notify_body = f"สิทธิ์ของคุณถูกเปลี่ยนจาก {old_role or '-'} เป็น {role} โดย {actor_email}"
+                    notify_title = 'Role updated'
+                    notify_body = f"Your role has been changed from {old_role or '-'} to {role} by {actor_email}"
                     cursor.execute(
                         """
                         INSERT INTO notifications (event_type, title, body, actor_id, audience)
