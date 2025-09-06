@@ -135,18 +135,84 @@ def create_app() -> Flask:
 
             payload = request.get_json(silent=True) or {}
             role = (payload.get('role') or '').lower()
+            # Resolve actor (admin performing the change)
+            actor_id = None
+            try:
+                header_actor = request.headers.get('X-Actor-Id')
+                if header_actor is not None:
+                    actor_id = int(header_actor)
+            except Exception:
+                actor_id = None
+            if actor_id is None:
+                try:
+                    body_actor = payload.get('actor_id')
+                    if body_actor is not None:
+                        actor_id = int(body_actor)
+                except Exception:
+                    actor_id = None
             if role not in ('admin', 'staff', 'pending'):
                 return jsonify({"status": "error", "message": "Invalid role specified."}), 400
             conn = get_mysql_connection()
             with conn.cursor() as cursor:
-                cursor.execute("SELECT id FROM users WHERE id=%s LIMIT 1", (user_id,))
-                exists = cursor.fetchone()
-                if not exists:
+                # Fetch current user to obtain old role and email
+                cursor.execute("SELECT id, email, role FROM users WHERE id=%s LIMIT 1", (user_id,))
+                current_user = cursor.fetchone()
+                if not current_user:
                     conn.close()
                     return jsonify({"status": "error", "message": "Selected user cannot be found. Please refresh the list and try again."}), 404
+                old_role = (current_user.get('role') or '').lower() or None
                 cursor.execute("UPDATE users SET role=%s WHERE id=%s", (role, user_id))
             conn.commit()
             conn.close()
+
+            # Write audit log and notification (best-effort)
+            try:
+                conn2 = get_mysql_connection()
+                with conn2.cursor() as cursor:
+                    # Audit
+                    cursor.execute(
+                        """
+                        INSERT INTO role_change_logs (user_id, old_role, new_role, changed_by, reason)
+                        VALUES (%s, %s, %s, %s, %s)
+                        """,
+                        (user_id, old_role, role, actor_id, None)
+                    )
+                    # Resolve actor email for message
+                    actor_email = 'Admin'
+                    if actor_id is not None:
+                        cursor.execute("SELECT email FROM users WHERE id=%s LIMIT 1", (actor_id,))
+                        a = cursor.fetchone()
+                        if a and a.get('email'):
+                            actor_email = a.get('email')
+                    # Direct notification to affected user
+                    notify_title = 'อัปเดตสิทธิ์ผู้ใช้'
+                    notify_body = f"สิทธิ์ของคุณถูกเปลี่ยนจาก {old_role or '-'} เป็น {role} โดย {actor_email}"
+                    cursor.execute(
+                        """
+                        INSERT INTO notifications (event_type, title, body, actor_id, audience)
+                        VALUES ('role_changed', %s, %s, %s, 'direct')
+                        """,
+                        (notify_title, notify_body, actor_id)
+                    )
+                    cursor.execute("SELECT LAST_INSERT_ID() AS nid")
+                    nid_row = cursor.fetchone()
+                    notification_id = int(nid_row.get('nid')) if nid_row else None
+                    if notification_id is not None:
+                        cursor.execute(
+                            """
+                            INSERT INTO notification_recipients (notification_id, user_id)
+                            VALUES (%s, %s)
+                            """,
+                            (notification_id, user_id)
+                        )
+                conn2.commit()
+                conn2.close()
+            except Exception:
+                try:
+                    conn2.rollback()
+                    conn2.close()
+                except Exception:
+                    pass
 
             if request.headers.get('X-Demo-Force-EmailFail') == '1':
                 return jsonify({
@@ -897,6 +963,89 @@ def create_app() -> Flask:
                 }
             })
 
+        except Exception as e:
+            return jsonify({"status": "error", "message": str(e)}), 500
+
+    # ---------------- Notifications API ----------------
+    @app.route('/notifications', methods=['GET'])
+    def list_notifications():
+        try:
+            user_id = request.args.get('user_id')
+            email = request.args.get('email')
+            only_unread = (request.args.get('only_unread') or '0') in ('1','true','yes')
+
+            if not user_id and not email:
+                return jsonify({"status": "error", "message": "user_id or email required"}), 400
+
+            conn = get_mysql_connection()
+            with conn.cursor() as cursor:
+                if not user_id and email:
+                    cursor.execute("SELECT id FROM users WHERE LOWER(email)=LOWER(%s) LIMIT 1", (email,))
+                    row = cursor.fetchone()
+                    if not row:
+                        conn.close()
+                        return jsonify({"status": "success", "notifications": []})
+                    user_id = int(row['id'])
+
+                base_sql = (
+                    """
+                    SELECT n.id                 AS id,
+                           n.event_type         AS event_type,
+                           n.title              AS title,
+                           n.body               AS body,
+                           n.actor_id           AS actor_id,
+                           u.email              AS actor_email,
+                           n.created_at         AS created_at,
+                           nr.is_read           AS is_read,
+                           nr.read_at           AS read_at
+                    FROM notification_recipients nr
+                    JOIN notifications n ON n.id = nr.notification_id
+                    LEFT JOIN users u ON u.id = n.actor_id
+                    WHERE nr.user_id = %s
+                    """
+                )
+                params = [int(user_id)]
+                if only_unread:
+                    base_sql += " AND nr.is_read = 0"
+                base_sql += " ORDER BY n.created_at DESC LIMIT 100"
+                cursor.execute(base_sql, params)
+                rows = cursor.fetchall()
+            conn.close()
+            return jsonify({"status": "success", "notifications": rows})
+        except Exception as e:
+            return jsonify({"status": "error", "message": str(e)}), 500
+
+    @app.route('/notifications/mark-read', methods=['POST'])
+    def mark_notification_read():
+        try:
+            payload = request.get_json(silent=True) or {}
+            notification_id = payload.get('notification_id')
+            user_id = payload.get('user_id')
+            email = payload.get('email')
+            if not notification_id:
+                return jsonify({"status": "error", "message": "notification_id required"}), 400
+
+            conn = get_mysql_connection()
+            with conn.cursor() as cursor:
+                if not user_id and email:
+                    cursor.execute("SELECT id FROM users WHERE LOWER(email)=LOWER(%s) LIMIT 1", (email,))
+                    row = cursor.fetchone()
+                    if not row:
+                        conn.close()
+                        return jsonify({"status": "error", "message": "user not found"}), 404
+                    user_id = int(row['id'])
+
+                cursor.execute(
+                    """
+                    UPDATE notification_recipients
+                    SET is_read=1, read_at=NOW()
+                    WHERE notification_id=%s AND user_id=%s
+                    """,
+                    (int(notification_id), int(user_id))
+                )
+            conn.commit()
+            conn.close()
+            return jsonify({"status": "success"})
         except Exception as e:
             return jsonify({"status": "error", "message": str(e)}), 500
 
