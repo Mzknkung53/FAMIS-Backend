@@ -104,6 +104,34 @@ def background_process(task_id, file_bytes, filename, user_id=None, user_email=N
             except Exception:
                 pass
 
+        # Notify: OCR processing started
+        try:
+            conn = get_mysql_connection()
+            with conn.cursor() as cursor:
+                cursor.execute(
+                    """
+                    INSERT INTO notifications (event_type, title, body, actor_id, audience)
+                    VALUES (%s, %s, %s, %s, 'direct')
+                    """,
+                    ('general', 'OCR started', f'OCR processing started for {filename}', uploader_id)
+                )
+                cursor.execute("SELECT LAST_INSERT_ID() AS nid")
+                row = cursor.fetchone()
+                nid = int(row.get('nid')) if row else None
+                if nid:
+                    cursor.execute(
+                        "INSERT INTO notification_recipients (notification_id, user_id) VALUES (%s, %s)",
+                        (nid, uploader_id)
+                    )
+            conn.commit()
+            conn.close()
+        except Exception:
+            try:
+                conn.rollback()
+                conn.close()
+            except Exception:
+                pass
+
         ocr_text = read_text_from_file(save_path)
 
         with open(save_path, "rb") as f:
@@ -220,6 +248,34 @@ def background_process(task_id, file_bytes, filename, user_id=None, user_email=N
             conn.commit()
         finally:
             try:
+                conn.close()
+            except Exception:
+                pass
+
+        # Notify: extraction completed successfully
+        try:
+            conn = get_mysql_connection()
+            with conn.cursor() as cursor:
+                cursor.execute(
+                    """
+                    INSERT INTO notifications (event_type, title, body, actor_id, audience)
+                    VALUES (%s, %s, %s, %s, 'direct')
+                    """,
+                    ('task_completed', 'Extract successful', f'Extract file ({filename}) successful', uploader_id)
+                )
+                cursor.execute("SELECT LAST_INSERT_ID() AS nid")
+                row = cursor.fetchone()
+                nid = int(row.get('nid')) if row else None
+                if nid:
+                    cursor.execute(
+                        "INSERT INTO notification_recipients (notification_id, user_id) VALUES (%s, %s)",
+                        (nid, uploader_id)
+                    )
+            conn.commit()
+            conn.close()
+        except Exception:
+            try:
+                conn.rollback()
                 conn.close()
             except Exception:
                 pass
