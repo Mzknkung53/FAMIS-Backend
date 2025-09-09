@@ -218,7 +218,8 @@ def background_process(task_id, file_bytes, filename, user_id=None, user_email=N
             "timestamp": utc_now_iso(),
             "result": interpreted_data,
             "file_base64": encoded_pdf,
-            "filename": filename
+            "filename": filename,
+            "file_id": file_id
         }
         completed_unconfirmed_tasks[task_id] = job_store[task_id]
 

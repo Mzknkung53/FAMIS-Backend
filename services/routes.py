@@ -381,6 +381,73 @@ def create_app() -> Flask:
             return jsonify({"status": "error", "message": "Task not complete"}), 400
         return jsonify({"status": "success", "data": job["result"]}), 200
 
+    @app.route('/tasks/<task_id>', methods=['DELETE'])
+    def delete_task_and_data(task_id: str):
+        job = job_store.get(task_id) or completed_unconfirmed_tasks.get(task_id)
+        if not job:
+            return jsonify({"status": "error", "message": "Task not found"}), 404
+
+        file_id = job.get('file_id')
+        filename = job.get('filename')
+        # Fallback resolution for legacy tasks without file_id
+        if not file_id and filename:
+            try:
+                conn0 = get_mysql_connection()
+                with conn0.cursor() as c0:
+                    c0.execute("SELECT FileID FROM UploadFiles WHERE FileName=%s ORDER BY UploadDatetime DESC LIMIT 1", (filename,))
+                    r0 = c0.fetchone()
+                    if r0:
+                        file_id = int(r0.get('FileID'))
+                conn0.close()
+            except Exception:
+                file_id = None
+        if not file_id:
+            # Remove stale memory even if DB delete is skipped
+            completed_unconfirmed_tasks.pop(task_id, None)
+            job_store.pop(task_id, None)
+            return jsonify({"status": "success", "message": "Task cleared from memory (no file found)"})
+
+        try:
+            conn = get_mysql_connection()
+            file_path = None
+            with conn.cursor() as cursor:
+                cursor.execute("SELECT FilePath FROM UploadFiles WHERE FileID=%s LIMIT 1", (file_id,))
+                row = cursor.fetchone()
+                if row:
+                    file_path = row.get('FilePath')
+
+                # Remove staged and approved data, then the upload record
+                cursor.execute("DELETE FROM StagedExtractedData WHERE FileID=%s", (file_id,))
+                cursor.execute("DELETE FROM ExtractedData WHERE FileID=%s", (file_id,))
+                cursor.execute("DELETE FROM UploadFiles WHERE FileID=%s", (file_id,))
+            conn.commit()
+            conn.close()
+
+            # Delete file on disk
+            if file_path:
+                try:
+                    fname = os.path.basename(file_path)
+                    abs_dir = os.path.join(os.getcwd(), 'uploads')
+                    abs_path = os.path.join(abs_dir, fname)
+                    if abs_path.startswith(abs_dir) and os.path.exists(abs_path):
+                        os.remove(abs_path)
+                except Exception:
+                    pass
+
+            # Remove from memory stores
+            job_store.pop(task_id, None)
+            completed_unconfirmed_tasks.pop(task_id, None)
+
+            return jsonify({"status": "success"})
+        except Exception as e:
+            traceback.print_exc()
+            try:
+                conn.rollback()
+                conn.close()
+            except Exception:
+                pass
+            return jsonify({"status": "error", "message": str(e)}), 500
+
     @app.route("/confirm-task", methods=["POST"])
     def confirm_task_data():
         payload = request.get_json()
@@ -821,19 +888,22 @@ def create_app() -> Flask:
             resolved_id = int(resolved.get('id'))
 
             with conn.cursor() as cursor:
+                # Only show uploads that have been confirmed/saved by staff (exist in ExtractedData)
                 cursor.execute(
                     """
-                    SELECT FileID         AS file_id,
-                           FileName       AS file_name,
-                           FileFormat     AS file_format,
-                           FileSize       AS file_size,
-                           DATE_FORMAT(CONVERT_TZ(UploadDatetime, @@session.time_zone, '+00:00'), '%%Y-%%m-%%dT%%H:%%i:%%sZ') AS uploaded_at,
-                           UploadStatus   AS status,
-                           FilePath       AS file_path,
-                           RejectReason   AS reject_reason
-                    FROM uploadfiles
-                    WHERE uploaded_by = %s
-                    ORDER BY UploadDatetime DESC
+                    SELECT uf.FileID         AS file_id,
+                           uf.FileName       AS file_name,
+                           uf.FileFormat     AS file_format,
+                           uf.FileSize       AS file_size,
+                           DATE_FORMAT(CONVERT_TZ(uf.UploadDatetime, @@session.time_zone, '+00:00'), '%%Y-%%m-%%dT%%H:%%i:%%sZ') AS uploaded_at,
+                           uf.UploadStatus   AS status,
+                           uf.FilePath       AS file_path,
+                           uf.RejectReason   AS reject_reason
+                    FROM uploadfiles uf
+                    INNER JOIN ExtractedData ed ON ed.FileID = uf.FileID
+                    WHERE uf.uploaded_by = %s
+                    GROUP BY uf.FileID
+                    ORDER BY uf.UploadDatetime DESC
                     """,
                     (resolved_id,)
                 )
@@ -908,6 +978,62 @@ def create_app() -> Flask:
             return jsonify({"status": "success", "items": rows})
 
         except Exception as e:
+            return jsonify({"status": "error", "message": str(e)}), 500
+
+    @app.route('/uploads/<int:file_id>', methods=['DELETE'])
+    def delete_upload(file_id: int):
+        try:
+            conn = get_mysql_connection()
+            file_path = None
+            file_name = None
+            with conn.cursor() as cursor:
+                cursor.execute("SELECT FilePath, FileName FROM UploadFiles WHERE FileID=%s LIMIT 1", (file_id,))
+                row = cursor.fetchone()
+                if not row:
+                    conn.close()
+                    return jsonify({"status": "error", "message": "File not found"}), 404
+                file_path = row.get('FilePath')
+                file_name = row.get('FileName')
+
+                cursor.execute("DELETE FROM StagedExtractedData WHERE FileID=%s", (file_id,))
+                cursor.execute("DELETE FROM ExtractedData WHERE FileID=%s", (file_id,))
+                cursor.execute("DELETE FROM UploadFiles WHERE FileID=%s", (file_id,))
+            conn.commit()
+            conn.close()
+
+            if file_path:
+                try:
+                    fname = os.path.basename(file_path)
+                    abs_dir = os.path.join(os.getcwd(), 'uploads')
+                    abs_path = os.path.join(abs_dir, fname)
+                    if abs_path.startswith(abs_dir) and os.path.exists(abs_path):
+                        os.remove(abs_path)
+                except Exception:
+                    pass
+
+            # Cleanup any in-memory tasks referencing this file_id (safety)
+            try:
+                stale_task_ids = [tid for tid, payload in completed_unconfirmed_tasks.items() if int(payload.get('file_id') or -1) == int(file_id)]
+                for tid in stale_task_ids:
+                    completed_unconfirmed_tasks.pop(tid, None)
+                    job_store.pop(tid, None)
+                # Fallback: also clear tasks by filename match if file_id is absent in old payloads
+                if file_name:
+                    stale_by_name = [tid for tid, payload in completed_unconfirmed_tasks.items() if (payload.get('filename') or '').strip() == (file_name or '').strip()]
+                    for tid in stale_by_name:
+                        completed_unconfirmed_tasks.pop(tid, None)
+                        job_store.pop(tid, None)
+            except Exception:
+                pass
+
+            return jsonify({"status": "success"})
+        except Exception as e:
+            traceback.print_exc()
+            try:
+                conn.rollback()
+                conn.close()
+            except Exception:
+                pass
             return jsonify({"status": "error", "message": str(e)}), 500
 
     @app.route("/uploads/<path:filename>")
