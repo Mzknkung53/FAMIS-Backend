@@ -363,14 +363,70 @@ def create_app() -> Flask:
 
     @app.route("/task-board", methods=["GET"])
     def get_pending_tasks_for_user():
-        data = [
+        # In-memory tasks (pre-confirm, from current process lifetime)
+        memory_data = [
             {"task_id": task_id, **payload}
             for task_id, payload in completed_unconfirmed_tasks.items()
         ]
-        return jsonify({
-            "status": "success",
-            "data": data
-        })
+
+        # DB-backed staged tasks (persist across restarts)
+        # Optional filter by user
+        q_user_id = request.args.get('user_id')
+        q_email = request.args.get('email')
+        db_data = []
+        try:
+            conn = get_mysql_connection()
+            with conn.cursor() as cursor:
+                # Resolve user from email if provided
+                resolved_id = None
+                if q_email and not q_user_id:
+                    cursor.execute("SELECT id FROM users WHERE LOWER(email)=LOWER(%s) LIMIT 1", (q_email,))
+                    r = cursor.fetchone()
+                    resolved_id = int(r['id']) if r else None
+                elif q_user_id:
+                    try:
+                        resolved_id = int(q_user_id)
+                    except Exception:
+                        resolved_id = None
+
+                base_sql = (
+                    """
+                    SELECT uf.FileID AS file_id,
+                           uf.FileName AS file_name,
+                           DATE_FORMAT(CONVERT_TZ(uf.UploadDatetime, @@session.time_zone, '+00:00'), '%Y-%m-%dT%H:%i:%sZ') AS uploaded_at
+                    FROM UploadFiles uf
+                    INNER JOIN StagedExtractedData s ON s.FileID = uf.FileID
+                    WHERE uf.UploadStatus = 'pending'
+                    {USER_FILTER}
+                    GROUP BY uf.FileID
+                    ORDER BY uf.UploadDatetime DESC
+                    """
+                )
+                if resolved_id is not None:
+                    sql = base_sql.replace('{USER_FILTER}', 'AND uf.uploaded_by = %s')
+                    cursor.execute(sql, (resolved_id,))
+                else:
+                    sql = base_sql.replace('{USER_FILTER}', '')
+                    cursor.execute(sql)
+                rows = cursor.fetchall()
+                for r in rows:
+                    db_data.append({
+                        "task_id": f"file:{int(r['file_id'])}",
+                        "status": "complete",
+                        "message": "This file is processed and waiting for confirmation.",
+                        "timestamp": r.get('uploaded_at'),
+                        "filename": r.get('file_name')
+                    })
+            conn.close()
+        except Exception:
+            try:
+                conn.close()
+            except Exception:
+                pass
+
+        # Merge memory first (newer tasks), then DB-backed staged items
+        data = memory_data + db_data
+        return jsonify({"status": "success", "data": data})
 
     @app.route("/task-result/<task_id>", methods=["GET"])
     def get_task_result_details(task_id):
