@@ -689,26 +689,40 @@ def create_app() -> Flask:
 
             conn = get_mysql_connection()
             with conn.cursor() as cursor:
-                insert_upload_sql = """
-                    INSERT INTO uploadfiles
-                    (uploaded_by, reviewed_by, FileName, FileFormat, FileSize, UploadDatetime, FilePath, OCRText, UploadStatus)
-                    VALUES (%s, %s, %s, %s, %s, NOW(), %s, %s, %s)
-                """
-                cursor.execute(
-                    insert_upload_sql,
-                    (
-                        uploader_id,
-                        None,
-                        filename,
-                        file_ext,
-                        file_size_bytes or 0,
-                        saved_file_path or "",
-                        None,
-                        "pending"
+                file_id = None
+                # If this save came from a background task, reuse the original UploadFiles row
+                if task_id:
+                    job = job_store.get(task_id) or completed_unconfirmed_tasks.get(task_id)
+                    if job and job.get('file_id'):
+                        file_id = int(job.get('file_id'))
+                        # Optionally update stored file path on uploadfiles
+                        try:
+                            cursor.execute("UPDATE UploadFiles SET FilePath=%s WHERE FileID=%s", (saved_file_path or "", file_id))
+                        except Exception:
+                            pass
+
+                # If no existing file_id, create a new UploadFiles row (manual save flow)
+                if not file_id:
+                    insert_upload_sql = """
+                        INSERT INTO uploadfiles
+                        (uploaded_by, reviewed_by, FileName, FileFormat, FileSize, UploadDatetime, FilePath, OCRText, UploadStatus)
+                        VALUES (%s, %s, %s, %s, %s, NOW(), %s, %s, %s)
+                    """
+                    cursor.execute(
+                        insert_upload_sql,
+                        (
+                            uploader_id,
+                            None,
+                            filename,
+                            file_ext,
+                            file_size_bytes or 0,
+                            saved_file_path or "",
+                            None,
+                            "pending"
+                        )
                     )
-                )
-                file_id = cursor.lastrowid
-                print(f"/save: created uploadfiles row -> FileID={file_id}, uploaded_by={uploader_id}")
+                    file_id = cursor.lastrowid
+                    print(f"/save: created uploadfiles row -> FileID={file_id}, uploaded_by={uploader_id}")
 
                 insert_data_sql = """
                     INSERT INTO ExtractedData
@@ -742,6 +756,13 @@ def create_app() -> Flask:
 
                 if values:
                     cursor.executemany(insert_data_sql, values)
+
+                # If came from staged task, clear staged rows so it won't show again in staff waiting list
+                if task_id and file_id:
+                    try:
+                        cursor.execute("DELETE FROM StagedExtractedData WHERE FileID=%s", (file_id,))
+                    except Exception:
+                        pass
 
             conn.commit()
             conn.close()
