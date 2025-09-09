@@ -356,7 +356,9 @@ def create_app() -> Flask:
                 "timestamp": job["timestamp"],
                 "result": job["result"],
                 "file_base64": job["file_base64"],
-                "filename": job["filename"]
+                "filename": job["filename"],
+                "display_name": job.get("display_name"),
+                "file_id": job.get("file_id")
             })
 
         return jsonify(job)
@@ -364,10 +366,12 @@ def create_app() -> Flask:
     @app.route("/task-board", methods=["GET"])
     def get_pending_tasks_for_user():
         # In-memory tasks (pre-confirm, from current process lifetime)
-        memory_data = [
-            {"task_id": task_id, **payload}
-            for task_id, payload in completed_unconfirmed_tasks.items()
-        ]
+        memory_data = []
+        for task_id, payload in completed_unconfirmed_tasks.items():
+            item = {"task_id": task_id, **payload}
+            if payload.get('display_name'):
+                item['filename'] = payload.get('display_name')
+            memory_data.append(item)
 
         # DB-backed staged tasks (persist across restarts)
         # Optional filter by user

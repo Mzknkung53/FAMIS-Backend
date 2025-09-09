@@ -133,6 +133,18 @@ def background_process(task_id, file_bytes, filename, user_id=None, user_email=N
             classified_type = classify_document_type(page_data)
             page_data["document_type"] = classified_type
 
+        # Build display name: <doc_type> : <description>
+        display_name = filename
+        try:
+            primary = next((d for d in interpreted_data if d.get('description')), None) or (interpreted_data[0] if interpreted_data else None)
+            if primary:
+                dt = (primary.get('document_type') or '').strip()
+                desc = (primary.get('description') or '').strip()
+                if dt and desc:
+                    display_name = f"{dt} : {desc}"
+        except Exception:
+            pass
+
         def parse_thai_date(date_text: str) -> str | None:
             if not date_text:
                 return None
@@ -219,6 +231,7 @@ def background_process(task_id, file_bytes, filename, user_id=None, user_email=N
             "result": interpreted_data,
             "file_base64": encoded_pdf,
             "filename": filename,
+            "display_name": display_name,
             "file_id": file_id
         }
         completed_unconfirmed_tasks[task_id] = job_store[task_id]
