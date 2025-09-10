@@ -399,10 +399,8 @@ def create_app() -> Flask:
                            uf.FileName AS file_name,
                            DATE_FORMAT(CONVERT_TZ(uf.UploadDatetime, @@session.time_zone, '+00:00'), '%Y-%m-%dT%H:%i:%sZ') AS uploaded_at
                     FROM UploadFiles uf
-                    INNER JOIN StagedExtractedData s ON s.FileID = uf.FileID
-                    WHERE uf.UploadStatus = 'pending'
+                    WHERE uf.Confirmed = 'Unconfirmed'
                     {USER_FILTER}
-                    GROUP BY uf.FileID
                     ORDER BY uf.UploadDatetime DESC
                     """
                 )
@@ -512,6 +510,9 @@ def create_app() -> Flask:
     def confirm_task_data():
         payload = request.get_json()
         task_id = payload.get("task_id")
+        reviewer_id = payload.get("reviewer_id")
+        reviewer_email = payload.get("reviewer_email")
+        title = payload.get("title")
         if not task_id:
             return jsonify({"status": "error", "message": "No task_id"}), 400
 
@@ -519,15 +520,48 @@ def create_app() -> Flask:
         if not task:
             return jsonify({"status": "error", "message": "Task not found"}), 404
 
+        file_id = task.get("file_id")
+        filename = task.get("filename")
+        if not file_id:
+            return jsonify({"status": "error", "message": "File id missing for task"}), 400
+
         try:
             conn = get_mysql_connection()
             with conn.cursor() as cursor:
-                sql = """
-                    INSERT INTO ConfirmedTasks
-                    (TaskID, FileName, ConfirmedAt)
-                    VALUES (%s, %s, NOW())
-                """
-                cursor.execute(sql, (task_id, task["filename"]))
+                # Resolve reviewer id from email if provided
+                if reviewer_id is None and reviewer_email:
+                    cursor.execute("SELECT id FROM users WHERE LOWER(email)=LOWER(%s) LIMIT 1", (reviewer_email,))
+                    row = cursor.fetchone()
+                    reviewer_id = int(row['id']) if row else None
+
+                # Mark UploadFiles as Confirmed
+                cursor.execute("UPDATE UploadFiles SET Confirmed='Confirmed' WHERE FileID=%s", (file_id,))
+
+                # Compute display title from extracted result if available
+                display_title = None
+                try:
+                    result = task.get('result') or []
+                    primary = next((d for d in result if d.get('description')), None) or (result[0] if result else None)
+                    if primary:
+                        dt = (primary.get('document_type') or '').strip()
+                        desc = (primary.get('description') or '').strip()
+                        if dt and desc:
+                            display_title = f"{dt} : {desc}"
+                except Exception:
+                    display_title = None
+                if not display_title:
+                    display_title = (title or task.get('display_name') or filename)
+
+                # Create tracking record with pending status for admin review
+                cursor.execute(
+                    """
+                    INSERT INTO uploadfiles_track
+                    (FileID, uploaded_by, reviewed_by, Title, FileName, FileFormat, FileSize, UploadDatetime, FilePath, OCRText, Status, reject_reason, StatusUpdatedAt)
+                    SELECT uf.FileID, uf.uploaded_by, %s, %s, uf.FileName, uf.FileFormat, uf.FileSize, uf.UploadDatetime, uf.FilePath, uf.OCRText, 'pending', NULL, NOW()
+                    FROM UploadFiles uf WHERE uf.FileID=%s
+                    """,
+                    (reviewer_id, display_title, file_id)
+                )
 
             conn.commit()
             conn.close()
@@ -535,7 +569,7 @@ def create_app() -> Flask:
             completed_unconfirmed_tasks.pop(task_id, None)
             job_store.pop(task_id, None)
 
-            return jsonify({"status": "success", "message": "Success record"}), 200
+            return jsonify({"status": "success"}), 200
 
         except Exception as e:
             print("❌ Confirm Task Error:", e)
@@ -690,26 +724,22 @@ def create_app() -> Flask:
             conn = get_mysql_connection()
             with conn.cursor() as cursor:
                 file_id = None
-                # If this save came from a background task, reuse the original UploadFiles row
                 if task_id:
                     job = job_store.get(task_id) or completed_unconfirmed_tasks.get(task_id)
                     if job and job.get('file_id'):
                         file_id = int(job.get('file_id'))
-                        # Optionally update stored file path on uploadfiles
                         try:
                             cursor.execute("UPDATE UploadFiles SET FilePath=%s WHERE FileID=%s", (saved_file_path or "", file_id))
                         except Exception:
                             pass
 
-                # If no existing file_id, create a new UploadFiles row (manual save flow)
                 if not file_id:
-                    insert_upload_sql = """
-                        INSERT INTO uploadfiles
-                        (uploaded_by, reviewed_by, FileName, FileFormat, FileSize, UploadDatetime, FilePath, OCRText, UploadStatus)
-                        VALUES (%s, %s, %s, %s, %s, NOW(), %s, %s, %s)
-                    """
                     cursor.execute(
-                        insert_upload_sql,
+                        """
+                        INSERT INTO uploadfiles
+                        (uploaded_by, reviewed_by, FileName, FileFormat, FileSize, UploadDatetime, FilePath, OCRText, Confirmed)
+                        VALUES (%s, %s, %s, %s, %s, NOW(), %s, %s, 'Unconfirmed')
+                        """,
                         (
                             uploader_id,
                             None,
@@ -718,19 +748,20 @@ def create_app() -> Flask:
                             file_size_bytes or 0,
                             saved_file_path or "",
                             None,
-                            "pending"
                         )
                     )
                     file_id = cursor.lastrowid
                     print(f"/save: created uploadfiles row -> FileID={file_id}, uploaded_by={uploader_id}")
 
+                # Replace ExtractedData rows for this file
+                cursor.execute("DELETE FROM ExtractedData WHERE FileID=%s", (file_id,))
+
                 insert_data_sql = """
                     INSERT INTO ExtractedData
-                    (PageNumber, BillNumber, DocTypeID, SupplierName, Amount, PaymentDate, Signature, FileID, FilePath)
-                    VALUES (%s, %s, %s,        %s,           %s,     %s,          %s,        %s,       %s)
+                    (FileID, BillNumber, Amount, SupplierName, PaymentDate, Signature, DocTypeID, PageNumber, ExtractedAt, FilePath)
+                    VALUES (%s,%s,%s,%s,%s,%s,%s,%s,NOW(),%s)
                 """
 
-                values = []
                 for doc in structured_data:
                     raw_amt = doc.get("amount")
                     try:
@@ -739,30 +770,47 @@ def create_app() -> Flask:
                         amt_val = None
 
                     doc_type_id = resolve_doc_type_id(doc.get("document_type"))
-                    if doc_type_id is None:
-                        doc_type_id = None
+                    cursor.execute(
+                        insert_data_sql,
+                        (
+                            file_id,
+                            doc.get("bill_number"),
+                            amt_val,
+                            doc.get("supplier_name"),
+                            doc.get("payment_date"),
+                            doc.get("signature"),
+                            doc_type_id,
+                            int(doc.get("page") or 1),
+                            saved_file_path
+                        )
+                    )
 
-                    values.append((
-                        doc.get("page"),
-                        doc.get("bill_number"),
-                        doc_type_id,
-                        doc.get("supplier_name"),
-                        amt_val,
-                        doc.get("payment_date"),
-                        doc.get("signature"),
-                        file_id,
-                        saved_file_path
-                    ))
+                # Mark confirmed and create tracking for admin
+                cursor.execute("UPDATE UploadFiles SET Confirmed='Confirmed' WHERE FileID=%s", (file_id,))
 
-                if values:
-                    cursor.executemany(insert_data_sql, values)
+                # Build a human-friendly title from structured_data: "<doc_type> : <description>"
+                computed_title = None
+                try:
+                    primary = next((d for d in structured_data if d.get('description')), None) or (structured_data[0] if structured_data else None)
+                    if primary:
+                        dt = (primary.get('document_type') or '').strip()
+                        desc = (primary.get('description') or '').strip()
+                        if dt and desc:
+                            computed_title = f"{dt} : {desc}"
+                except Exception:
+                    computed_title = None
+                if not computed_title:
+                    computed_title = filename
 
-                # If came from staged task, clear staged rows so it won't show again in staff waiting list
-                if task_id and file_id:
-                    try:
-                        cursor.execute("DELETE FROM StagedExtractedData WHERE FileID=%s", (file_id,))
-                    except Exception:
-                        pass
+                cursor.execute(
+                    """
+                    INSERT INTO uploadfiles_track
+                    (FileID, uploaded_by, reviewed_by, Title, FileName, FileFormat, FileSize, UploadDatetime, FilePath, OCRText, Status, reject_reason, StatusUpdatedAt)
+                    SELECT uf.FileID, uf.uploaded_by, NULL, %s, uf.FileName, uf.FileFormat, uf.FileSize, uf.UploadDatetime, uf.FilePath, uf.OCRText, 'pending', NULL, NOW()
+                    FROM UploadFiles uf WHERE uf.FileID=%s
+                    """,
+                    (computed_title, file_id)
+                )
 
             conn.commit()
             conn.close()
@@ -790,19 +838,24 @@ def create_app() -> Flask:
         try:
             conn = get_mysql_connection()
             with conn.cursor() as cursor:
-                cursor.execute("""
-                                SELECT uf.FileID           AS file_id,
-                                       uf.FileName         AS file_name,
-                                       DATE_FORMAT(CONVERT_TZ(uf.UploadDatetime, @@session.time_zone, '+00:00'), '%Y-%m-%dT%H:%i:%sZ') AS uploaded_at,
-                                       uf.UploadStatus     AS status,
-                                       uf.uploaded_by      AS uploaded_by,
-                                       u.email             AS uploader_email,
-                                       u.department        AS uploader_department
-                                FROM UploadFiles uf
-                                LEFT JOIN users u ON u.id = uf.uploaded_by
-                                WHERE uf.UploadStatus = 'pending'
-                                ORDER BY uf.UploadDatetime DESC
-                            """)
+                cursor.execute(
+                    """
+                    SELECT t.FileID                 AS file_id,
+                           COALESCE(t.Title, uf.FileName) AS title,
+                           uf.FileName              AS file_name,
+                           DATE_FORMAT(CONVERT_TZ(uf.UploadDatetime, @@session.time_zone, '+00:00'), '%Y-%m-%dT%H:%i:%sZ') AS uploaded_at,
+                           DATE_FORMAT(CONVERT_TZ(t.StatusUpdatedAt, @@session.time_zone, '+00:00'), '%Y-%m-%dT%H:%i:%sZ') AS status_updated_at,
+                           t.Status                 AS status,
+                           t.uploaded_by            AS uploaded_by,
+                           u.email                  AS uploader_email,
+                           u.department             AS uploader_department
+                    FROM uploadfiles_track t
+                    LEFT JOIN uploadfiles uf ON uf.FileID = t.FileID
+                    LEFT JOIN users u ON u.id = t.uploaded_by
+                    WHERE t.Status = 'pending'
+                    ORDER BY t.StatusUpdatedAt DESC
+                    """
+                )
                 rows = cursor.fetchall()
             conn.close()
             return jsonify({"status": "success", "uploads": rows})
@@ -819,16 +872,6 @@ def create_app() -> Flask:
 
             conn = get_mysql_connection()
             with conn.cursor() as cursor:
-                # Check current status for idempotency
-                cursor.execute("SELECT UploadStatus FROM UploadFiles WHERE FileID=%s LIMIT 1", (file_id,))
-                cur = cursor.fetchone()
-                if not cur:
-                    conn.close()
-                    return jsonify({"status": "error", "message": "File not found"}), 404
-                current_status = (cur.get('UploadStatus') or '').lower()
-                if current_status in ('approved', 'rejected'):
-                    conn.close()
-                    return jsonify({"status": "noop", "current_status": current_status}), 200
                 if reviewer_id is None and reviewer_email:
                     cursor.execute("SELECT id FROM users WHERE LOWER(email)=LOWER(%s) LIMIT 1", (reviewer_email,))
                     row = cursor.fetchone()
@@ -836,20 +879,11 @@ def create_app() -> Flask:
 
                 cursor.execute(
                     """
-                    UPDATE UploadFiles
-                    SET UploadStatus = 'approved',
-                        RejectReason = NULL,
-                        reviewed_by = COALESCE(%s, reviewed_by)
-                    WHERE FileID = %s
+                    UPDATE uploadfiles_track
+                    SET Status='approved', reject_reason=NULL, reviewed_by=COALESCE(%s, reviewed_by), StatusUpdatedAt=NOW()
+                    WHERE FileID=%s AND Status='pending'
                     """,
                     (reviewer_id, file_id)
-                )
-                cursor.execute(
-                    """
-                    INSERT INTO upload_review_logs (file_id, action, reason, reviewer_id, created_at)
-                    VALUES (%s, 'approved', NULL, %s, NOW())
-                    """,
-                    (file_id, reviewer_id)
                 )
             conn.commit()
             conn.close()
@@ -867,16 +901,6 @@ def create_app() -> Flask:
 
             conn = get_mysql_connection()
             with conn.cursor() as cursor:
-                # Check current status for idempotency
-                cursor.execute("SELECT UploadStatus FROM UploadFiles WHERE FileID=%s LIMIT 1", (file_id,))
-                cur = cursor.fetchone()
-                if not cur:
-                    conn.close()
-                    return jsonify({"status": "error", "message": "File not found"}), 404
-                current_status = (cur.get('UploadStatus') or '').lower()
-                if current_status in ('approved', 'rejected'):
-                    conn.close()
-                    return jsonify({"status": "noop", "current_status": current_status}), 200
                 if reviewer_id is None and reviewer_email:
                     cursor.execute("SELECT id FROM users WHERE LOWER(email)=LOWER(%s) LIMIT 1", (reviewer_email,))
                     row = cursor.fetchone()
@@ -884,20 +908,11 @@ def create_app() -> Flask:
 
                 cursor.execute(
                     """
-                    UPDATE UploadFiles
-                    SET UploadStatus = 'rejected',
-                        RejectReason = %s,
-                        reviewed_by = COALESCE(%s, reviewed_by)
-                    WHERE FileID = %s
+                    UPDATE uploadfiles_track
+                    SET Status='rejected', reject_reason=%s, reviewed_by=COALESCE(%s, reviewed_by), StatusUpdatedAt=NOW()
+                    WHERE FileID=%s AND Status='pending'
                     """,
                     (reason, reviewer_id, file_id)
-                )
-                cursor.execute(
-                    """
-                    INSERT INTO upload_review_logs (file_id, action, reason, reviewer_id, created_at)
-                    VALUES (%s, 'rejected', %s, %s, NOW())
-                    """,
-                    (file_id, reason, reviewer_id)
                 )
             conn.commit()
             conn.close()
@@ -912,20 +927,23 @@ def create_app() -> Flask:
             with conn.cursor() as cursor:
                 cursor.execute(
                     """
-                    SELECT uf.FileID           AS file_id,
-                           uf.FileName         AS file_name,
+                    SELECT t.FileID                 AS file_id,
+                           COALESCE(t.Title, uf.FileName) AS title,
+                           uf.FileName              AS file_name,
                            DATE_FORMAT(CONVERT_TZ(uf.UploadDatetime, @@session.time_zone, '+00:00'), '%Y-%m-%dT%H:%i:%sZ') AS uploaded_at,
-                           uf.UploadStatus     AS status,
-                           uf.reviewed_by      AS reviewed_by,
-                           u_rev.email         AS reviewer_email,
-                           u_rev.department    AS reviewer_department,
-                           u_up.email          AS uploader_email,
-                           u_up.department     AS uploader_department
-                    FROM UploadFiles uf
-                    LEFT JOIN users u_rev ON u_rev.id = uf.reviewed_by
-                    LEFT JOIN users u_up  ON u_up.id  = uf.uploaded_by
-                    WHERE uf.UploadStatus IN ('approved','rejected')
-                    ORDER BY uf.UploadDatetime DESC
+                           DATE_FORMAT(CONVERT_TZ(t.StatusUpdatedAt, @@session.time_zone, '+00:00'), '%Y-%m-%dT%H:%i:%sZ') AS status_updated_at,
+                           t.Status                 AS status,
+                           t.reviewed_by            AS reviewed_by,
+                           u_rev.email              AS reviewer_email,
+                           u_rev.department         AS reviewer_department,
+                           u_up.email               AS uploader_email,
+                           u_up.department          AS uploader_department
+                    FROM uploadfiles_track t
+                    LEFT JOIN uploadfiles uf ON uf.FileID = t.FileID
+                    LEFT JOIN users u_rev ON u_rev.id = t.reviewed_by
+                    LEFT JOIN users u_up  ON u_up.id  = t.uploaded_by
+                    WHERE t.Status IN ('approved','rejected')
+                    ORDER BY t.StatusUpdatedAt DESC
                     """
                 )
                 rows = cursor.fetchall()
@@ -977,12 +995,14 @@ def create_app() -> Flask:
                            uf.FileFormat     AS file_format,
                            uf.FileSize       AS file_size,
                            DATE_FORMAT(CONVERT_TZ(uf.UploadDatetime, @@session.time_zone, '+00:00'), '%%Y-%%m-%%dT%%H:%%i:%%sZ') AS uploaded_at,
-                           uf.UploadStatus   AS status,
+                           t.Status          AS status,
                            uf.FilePath       AS file_path,
-                           uf.RejectReason   AS reject_reason
+                           t.reject_reason   AS reject_reason,
+                           COALESCE(t.Title, uf.FileName) AS title
                     FROM uploadfiles uf
                     INNER JOIN ExtractedData ed ON ed.FileID = uf.FileID
-                    WHERE uf.uploaded_by = %s
+                    LEFT JOIN uploadfiles_track t ON t.FileID = uf.FileID
+                    WHERE uf.uploaded_by = %s AND uf.Confirmed = 'Confirmed'
                     GROUP BY uf.FileID
                     ORDER BY uf.UploadDatetime DESC
                     """,
@@ -1011,9 +1031,7 @@ def create_app() -> Flask:
                            ed.Signature    AS signature,
                            ed.DocTypeID    AS doc_type_id,
                            dt.DocTypeName  AS doc_type_name,
-                           uf.FilePath     AS file_path,
-                           uf.UploadStatus AS upload_status,
-                           uf.RejectReason AS reject_reason
+                           uf.FilePath     AS file_path
                     FROM ExtractedData ed
                     LEFT JOIN DocType dt     ON dt.DocTypeID = ed.DocTypeID
                     LEFT JOIN uploadfiles uf ON uf.FileID    = ed.FileID
@@ -1024,30 +1042,18 @@ def create_app() -> Flask:
                 )
                 rows = cursor.fetchall()
 
-                if not rows:
-                    cursor.execute(
-                        """
-                        SELECT NULL             AS data_id,
-                               s.PageNumber     AS page,
-                               s.BillNumber     AS bill_number,
-                               s.SupplierName   AS supplier_name,
-                               s.Amount         AS amount,
-                               s.PaymentDate    AS payment_date,
-                               s.Signature      AS signature,
-                               s.DocTypeID      AS doc_type_id,
-                               dt.DocTypeName   AS doc_type_name,
-                               s.FilePath       AS file_path,
-                               uf.UploadStatus  AS upload_status,
-                               uf.RejectReason  AS reject_reason
-                        FROM StagedExtractedData s
-                        LEFT JOIN DocType dt ON dt.DocTypeID = s.DocTypeID
-                        LEFT JOIN uploadfiles uf ON uf.FileID = s.FileID
-                        WHERE s.FileID = %s
-                        ORDER BY s.PageNumber ASC
-                        """,
-                        (file_id,)
-                    )
-                    rows = cursor.fetchall()
+                # Get latest track status
+                cursor.execute(
+                    """
+                    SELECT Status, reject_reason
+                    FROM uploadfiles_track
+                    WHERE FileID=%s
+                    ORDER BY StatusUpdatedAt DESC
+                    LIMIT 1
+                    """,
+                    (file_id,)
+                )
+                track = cursor.fetchone()
             conn.close()
 
             if rows and rows[0].get("file_path"):
@@ -1056,7 +1062,11 @@ def create_app() -> Flask:
                 for r in rows:
                     r["file_url"] = file_url
 
-            return jsonify({"status": "success", "items": rows})
+            resp = {"status": "success", "items": rows}
+            if track:
+                resp["track_status"] = track.get('Status')
+                resp["track_reject_reason"] = track.get('reject_reason')
+            return jsonify(resp)
 
         except Exception as e:
             return jsonify({"status": "error", "message": str(e)}), 500
@@ -1076,7 +1086,7 @@ def create_app() -> Flask:
                 file_path = row.get('FilePath')
                 file_name = row.get('FileName')
 
-                cursor.execute("DELETE FROM StagedExtractedData WHERE FileID=%s", (file_id,))
+                cursor.execute("DELETE FROM uploadfiles_track WHERE FileID=%s", (file_id,))
                 cursor.execute("DELETE FROM ExtractedData WHERE FileID=%s", (file_id,))
                 cursor.execute("DELETE FROM UploadFiles WHERE FileID=%s", (file_id,))
             conn.commit()

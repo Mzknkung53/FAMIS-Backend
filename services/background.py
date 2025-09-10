@@ -88,12 +88,12 @@ def background_process(task_id, file_bytes, filename, user_id=None, user_email=N
                 cursor.execute(
                     """
                     INSERT INTO uploadfiles
-                    (uploaded_by, reviewed_by, FileName, FileFormat, FileSize, UploadDatetime, FilePath, OCRText, UploadStatus)
+                    (uploaded_by, reviewed_by, FileName, FileFormat, FileSize, UploadDatetime, FilePath, OCRText, Confirmed)
                     VALUES (%s, %s, %s, %s, %s, NOW(), %s, %s, %s)
                     """,
                     (
                         uploader_id, None, filename, file_ext, file_size_bytes,
-                        saved_file_path, None, 'pending'
+                        saved_file_path, None, 'Unconfirmed'
                     )
                 )
                 file_id = cursor.lastrowid
@@ -173,84 +173,7 @@ def background_process(task_id, file_bytes, filename, user_id=None, user_email=N
         except Exception:
             pass
 
-        def parse_thai_date(date_text: str) -> str | None:
-            if not date_text:
-                return None
-            try:
-                months = {
-                    'มกราคม': 1, 'กุมภาพันธ์': 2, 'มีนาคม': 3, 'เมษายน': 4, 'พฤษภาคม': 5, 'มิถุนายน': 6,
-                    'กรกฎาคม': 7, 'สิงหาคม': 8, 'กันยายน': 9, 'ตุลาคม': 10, 'พฤศจิกายน': 11, 'ธันวาคม': 12
-                }
-                parts = str(date_text).strip().split()
-                if len(parts) >= 3:
-                    day = int(parts[0])
-                    month = months.get(parts[1], None)
-                    year = int(parts[2])
-                    if year > 2400:
-                        year -= 543
-                    if month:
-                        return f"{year:04d}-{month:02d}-{day:02d}"
-                return None
-            except Exception:
-                return None
-
-        try:
-            conn = get_mysql_connection()
-            with conn.cursor() as cursor:
-                insert_sql = (
-                    """
-                    INSERT INTO StagedExtractedData
-                    (FileID, PageNumber, BillNumber, SupplierName, Amount, PaymentDate, PaymentDateText, Signature, DocTypeID, FilePath, RawText, CreatedBy)
-                    VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
-                    ON DUPLICATE KEY UPDATE
-                      BillNumber=VALUES(BillNumber),
-                      SupplierName=VALUES(SupplierName),
-                      Amount=VALUES(Amount),
-                      PaymentDate=VALUES(PaymentDate),
-                      PaymentDateText=VALUES(PaymentDateText),
-                      Signature=VALUES(Signature),
-                      DocTypeID=VALUES(DocTypeID),
-                      FilePath=VALUES(FilePath),
-                      RawText=VALUES(RawText),
-                      UpdatedAt=NOW(),
-                      Version=Version+1
-                    """
-                )
-
-                for doc in interpreted_data:
-                    raw_amt = doc.get("amount")
-                    try:
-                        amt_val = float(str(raw_amt).replace(",", "")) if raw_amt else None
-                    except ValueError:
-                        amt_val = None
-
-                    doc_type_id = resolve_doc_type_id(doc.get("document_type"))
-                    pay_text = doc.get("payment_date")
-                    pay_date = parse_thai_date(pay_text)
-
-                    cursor.execute(
-                        insert_sql,
-                        (
-                            file_id,
-                            int(doc.get("page") or 1),
-                            doc.get("bill_number"),
-                            doc.get("supplier_name"),
-                            amt_val,
-                            pay_date,
-                            pay_text,
-                            doc.get("signature"),
-                            doc_type_id,
-                            saved_file_path,
-                            doc.get("raw_text"),
-                            uploader_id or None,
-                        )
-                    )
-            conn.commit()
-        finally:
-            try:
-                conn.close()
-            except Exception:
-                pass
+        # No staging write. Extracted data will be persisted on staff confirmation (/save).
 
         # Notify: extraction completed successfully
         try:
