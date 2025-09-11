@@ -399,7 +399,7 @@ def create_app() -> Flask:
                            uf.FileName AS file_name,
                            DATE_FORMAT(CONVERT_TZ(uf.UploadDatetime, @@session.time_zone, '+00:00'), '%Y-%m-%dT%H:%i:%sZ') AS uploaded_at
                     FROM UploadFiles uf
-                    WHERE uf.Confirmed = 'Unconfirmed'
+                    WHERE COALESCE(uf.Confirmed, 'Unconfirmed') = 'Unconfirmed'
                     {USER_FILTER}
                     ORDER BY uf.UploadDatetime DESC
                     """
@@ -411,6 +411,11 @@ def create_app() -> Flask:
                     sql = base_sql.replace('{USER_FILTER}', '')
                     cursor.execute(sql)
                 rows = cursor.fetchall()
+                # Fallback: if no rows for user, show all unconfirmed (helps when uploader mismatch)
+                if (not rows) and (resolved_id is not None):
+                    sql_all = base_sql.replace('{USER_FILTER}', '')
+                    cursor.execute(sql_all)
+                    rows = cursor.fetchall()
                 for r in rows:
                     db_data.append({
                         "task_id": f"file:{int(r['file_id'])}",
@@ -496,7 +501,7 @@ def create_app() -> Flask:
                     file_path = row.get('FilePath')
 
                 # Remove staged and approved data, then the upload record
-                cursor.execute("DELETE FROM StagedExtractedData WHERE FileID=%s", (file_id,))
+                cursor.execute("DELETE FROM uploadfiles_track WHERE FileID=%s", (file_id,))
                 cursor.execute("DELETE FROM ExtractedData WHERE FileID=%s", (file_id,))
                 cursor.execute("DELETE FROM UploadFiles WHERE FileID=%s", (file_id,))
             conn.commit()
