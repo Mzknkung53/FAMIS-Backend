@@ -374,14 +374,13 @@ def create_app() -> Flask:
             memory_data.append(item)
 
         # DB-backed staged tasks (persist across restarts)
-        # Optional filter by user
         q_user_id = request.args.get('user_id')
         q_email = request.args.get('email')
         db_data = []
+
         try:
             conn = get_mysql_connection()
             with conn.cursor() as cursor:
-                # Resolve user from email if provided
                 resolved_id = None
                 if q_email and not q_user_id:
                     cursor.execute("SELECT id FROM users WHERE LOWER(email)=LOWER(%s) LIMIT 1", (q_email,))
@@ -393,24 +392,25 @@ def create_app() -> Flask:
                     except Exception:
                         resolved_id = None
 
-                base_sql = (
-                    """
-                    SELECT uf.FileID AS file_id,
-                           uf.FileName AS file_name,
-                           DATE_FORMAT(CONVERT_TZ(uf.UploadDatetime, @@session.time_zone, '+00:00'), '%Y-%m-%dT%H:%i:%sZ') AS uploaded_at
-                    FROM UploadFiles uf
-                    WHERE uf.Confirmed = 'Unconfirmed'
-                    {USER_FILTER}
-                    ORDER BY uf.UploadDatetime DESC
-                    """
-                )
+                base_sql = """
+                SELECT uf.FileID AS file_id,
+                       uf.FileName AS file_name,
+                       DATE_FORMAT(CONVERT_TZ(uf.UploadDatetime, @@session.time_zone, '+00:00'), '%%Y-%%m-%%dT%%H:%%i:%%sZ') AS uploaded_at
+                FROM UploadFiles uf
+                WHERE uf.Confirmed = 'Unconfirmed'
+                {USER_FILTER}
+                ORDER BY uf.UploadDatetime DESC
+                """
+
                 if resolved_id is not None:
-                    sql = base_sql.replace('{USER_FILTER}', 'AND uf.uploaded_by = %s')
+                    sql = base_sql.replace("{USER_FILTER}", "AND uf.uploaded_by = %s")
                     cursor.execute(sql, (resolved_id,))
                 else:
-                    sql = base_sql.replace('{USER_FILTER}', '')
+                    sql = base_sql.replace("{USER_FILTER}", "")
                     cursor.execute(sql)
+
                 rows = cursor.fetchall()
+                print("DEBUG: DB rows fetched:", rows)  # <-- log สำหรับ debug
                 for r in rows:
                     db_data.append({
                         "task_id": f"file:{int(r['file_id'])}",
@@ -420,7 +420,8 @@ def create_app() -> Flask:
                         "filename": r.get('file_name')
                     })
             conn.close()
-        except Exception:
+        except Exception as e:
+            print("ERROR in /task-board:", e)
             try:
                 conn.close()
             except Exception:
