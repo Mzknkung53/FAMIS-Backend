@@ -374,13 +374,14 @@ def create_app() -> Flask:
             memory_data.append(item)
 
         # DB-backed staged tasks (persist across restarts)
+        # Optional filter by user
         q_user_id = request.args.get('user_id')
         q_email = request.args.get('email')
         db_data = []
-
         try:
             conn = get_mysql_connection()
             with conn.cursor() as cursor:
+                # Resolve user from email if provided
                 resolved_id = None
                 if q_email and not q_user_id:
                     cursor.execute("SELECT id FROM users WHERE LOWER(email)=LOWER(%s) LIMIT 1", (q_email,))
@@ -392,25 +393,24 @@ def create_app() -> Flask:
                     except Exception:
                         resolved_id = None
 
-                base_sql = """
-                SELECT uf.FileID AS file_id,
-                       uf.FileName AS file_name,
-                       DATE_FORMAT(CONVERT_TZ(uf.UploadDatetime, @@session.time_zone, '+00:00'), '%%Y-%%m-%%dT%%H:%%i:%%sZ') AS uploaded_at
-                FROM UploadFiles uf
-                WHERE uf.Confirmed = 'Unconfirmed'
-                {USER_FILTER}
-                ORDER BY uf.UploadDatetime DESC
-                """
-
+                base_sql = (
+                    """
+                    SELECT uf.FileID AS file_id,
+                           uf.FileName AS file_name,
+                           DATE_FORMAT(CONVERT_TZ(uf.UploadDatetime, @@session.time_zone, '+00:00'), '%Y-%m-%dT%H:%i:%sZ') AS uploaded_at
+                    FROM UploadFiles uf
+                    WHERE uf.Confirmed = 'Unconfirmed'
+                    {USER_FILTER}
+                    ORDER BY uf.UploadDatetime DESC
+                    """
+                )
                 if resolved_id is not None:
-                    sql = base_sql.replace("{USER_FILTER}", "AND uf.uploaded_by = %s")
+                    sql = base_sql.replace('{USER_FILTER}', 'AND uf.uploaded_by = %s')
                     cursor.execute(sql, (resolved_id,))
                 else:
-                    sql = base_sql.replace("{USER_FILTER}", "")
+                    sql = base_sql.replace('{USER_FILTER}', '')
                     cursor.execute(sql)
-
                 rows = cursor.fetchall()
-                print("DEBUG: DB rows fetched:", rows)  # <-- log สำหรับ debug
                 for r in rows:
                     db_data.append({
                         "task_id": f"file:{int(r['file_id'])}",
@@ -420,15 +420,35 @@ def create_app() -> Flask:
                         "filename": r.get('file_name')
                     })
             conn.close()
-        except Exception as e:
-            print("ERROR in /task-board:", e)
+        except Exception:
             try:
                 conn.close()
             except Exception:
                 pass
 
         # Merge memory first (newer tasks), then DB-backed staged items
-        data = memory_data + db_data
+        # Avoid duplicates: if memory contains a task with this file_id, skip DB one
+        try:
+            memory_file_ids = set()
+            for _, payload in completed_unconfirmed_tasks.items():
+                try:
+                    if payload.get('file_id') is not None:
+                        memory_file_ids.add(int(payload.get('file_id')))
+                except Exception:
+                    pass
+            deduped_db = []
+            for item in db_data:
+                try:
+                    if isinstance(item.get('task_id'), str) and item['task_id'].startswith('file:'):
+                        fid = int(item['task_id'].split(':',1)[1])
+                        if fid in memory_file_ids:
+                            continue
+                except Exception:
+                    pass
+                deduped_db.append(item)
+            data = memory_data + deduped_db
+        except Exception:
+            data = memory_data + db_data
         return jsonify({"status": "success", "data": data})
 
     @app.route("/task-result/<task_id>", methods=["GET"])
@@ -691,6 +711,19 @@ def create_app() -> Flask:
             print(f"/save: verified uploader -> id={uploader_id}, email={resolved.get('email')}, role={resolved.get('role')}")
         except Exception as e:
             return jsonify({"status": "error", "message": f"Uploader verification failed: {e}"}), 500
+
+        if not resolved:
+            return jsonify({"status": "error", "message": "Uploader not found"}), 400
+        if not bool(resolved.get("is_approved")):
+            return jsonify({"status": "error", "message": "Uploader not approved"}), 403
+        if (resolved.get("role") or "").lower() not in ("staff", "admin"):
+            return jsonify({"status": "error", "message": "Uploader role not allowed"}), 403
+
+        if user_id and user_email and int(user_id) != int(resolved.get("id")):
+            return jsonify({"status": "error", "message": "Uploader mismatch"}), 400
+
+        uploader_id = int(resolved.get("id"))
+        print(f"/save: verified uploader -> id={uploader_id}, email={resolved.get('email')}, role={resolved.get('role')}")
 
         try:
             saved_file_path = None
@@ -988,7 +1021,6 @@ def create_app() -> Flask:
             resolved_id = int(resolved.get('id'))
 
             with conn.cursor() as cursor:
-                # Only show uploads that have been confirmed/saved by staff (exist in ExtractedData)
                 cursor.execute(
                     """
                     SELECT uf.FileID         AS file_id,
