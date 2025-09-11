@@ -411,11 +411,6 @@ def create_app() -> Flask:
                     sql = base_sql.replace('{USER_FILTER}', '')
                     cursor.execute(sql)
                 rows = cursor.fetchall()
-                # Fallback: if no rows for user, show all unconfirmed (helps when uploader mismatch)
-                if (not rows) and (resolved_id is not None):
-                    sql_all = base_sql.replace('{USER_FILTER}', '')
-                    cursor.execute(sql_all)
-                    rows = cursor.fetchall()
                 for r in rows:
                     db_data.append({
                         "task_id": f"file:{int(r['file_id'])}",
@@ -889,7 +884,7 @@ def create_app() -> Flask:
                            u.email                  AS uploader_email,
                            u.department             AS uploader_department
                     FROM uploadfiles_track t
-                    LEFT JOIN uploadfiles uf ON uf.FileID = t.FileID
+                    LEFT JOIN UploadFiles uf ON uf.FileID = t.FileID
                     LEFT JOIN users u ON u.id = t.uploaded_by
                     WHERE t.Status = 'pending'
                     ORDER BY t.StatusUpdatedAt DESC
@@ -978,7 +973,7 @@ def create_app() -> Flask:
                            u_up.email               AS uploader_email,
                            u_up.department          AS uploader_department
                     FROM uploadfiles_track t
-                    LEFT JOIN uploadfiles uf ON uf.FileID = t.FileID
+                    LEFT JOIN UploadFiles uf ON uf.FileID = t.FileID
                     LEFT JOIN users u_rev ON u_rev.id = t.reviewed_by
                     LEFT JOIN users u_up  ON u_up.id  = t.uploaded_by
                     WHERE t.Status IN ('approved','rejected')
@@ -1033,13 +1028,21 @@ def create_app() -> Flask:
                            uf.FileFormat     AS file_format,
                            uf.FileSize       AS file_size,
                            DATE_FORMAT(CONVERT_TZ(uf.UploadDatetime, @@session.time_zone, '+00:00'), '%%Y-%%m-%%dT%%H:%%i:%%sZ') AS uploaded_at,
-                           t.Status          AS status,
+                           lt.Status         AS status,
                            uf.FilePath       AS file_path,
-                           t.reject_reason   AS reject_reason,
-                           COALESCE(t.Title, uf.FileName) AS title
-                    FROM uploadfiles uf
-                    INNER JOIN ExtractedData ed ON ed.FileID = uf.FileID
-                    LEFT JOIN uploadfiles_track t ON t.FileID = uf.FileID
+                           lt.reject_reason  AS reject_reason,
+                           COALESCE(lt.Title, uf.FileName) AS title
+                    FROM UploadFiles uf
+                    LEFT JOIN (
+                        SELECT t1.*
+                        FROM uploadfiles_track t1
+                        JOIN (
+                            SELECT FileID, MAX(StatusUpdatedAt) AS max_dt
+                            FROM uploadfiles_track
+                            GROUP BY FileID
+                        ) mx ON mx.FileID = t1.FileID AND mx.max_dt = t1.StatusUpdatedAt
+                    ) lt ON lt.FileID = uf.FileID
+                    LEFT JOIN ExtractedData ed ON ed.FileID = uf.FileID
                     WHERE uf.uploaded_by = %s AND uf.Confirmed = 'Confirmed'
                     GROUP BY uf.FileID
                     ORDER BY uf.UploadDatetime DESC
@@ -1072,7 +1075,7 @@ def create_app() -> Flask:
                            uf.FilePath     AS file_path
                     FROM ExtractedData ed
                     LEFT JOIN DocType dt     ON dt.DocTypeID = ed.DocTypeID
-                    LEFT JOIN uploadfiles uf ON uf.FileID    = ed.FileID
+                    LEFT JOIN UploadFiles uf ON uf.FileID    = ed.FileID
                     WHERE ed.FileID = %s
                     ORDER BY ed.PageNumber ASC
                     """,
