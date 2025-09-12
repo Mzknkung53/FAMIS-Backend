@@ -365,51 +365,66 @@ def create_app() -> Flask:
 
     @app.route("/task-board", methods=["GET"])
     def get_pending_tasks_for_user():
-        # In-memory tasks (pre-confirm, from current process lifetime)
-        memory_data = []
-        for task_id, payload in completed_unconfirmed_tasks.items():
-            item = {"task_id": task_id, **payload}
-            if payload.get('display_name'):
-                item['display_name'] = payload['display_name']
-            memory_data.append(item)
-
-        # DB-backed staged tasks (persist across restarts)
-        # Optional filter by user
+        # Resolve current user (REQUIRED). If cannot resolve, return empty to avoid leakage.
         q_user_id = request.args.get('user_id')
         q_email = request.args.get('email')
+
+        resolved_id = None
+        try:
+            if q_user_id is not None:
+                resolved_id = int(q_user_id)
+        except Exception:
+            resolved_id = None
+
+        if resolved_id is None and q_email:
+            try:
+                conn_r = get_mysql_connection()
+                with conn_r.cursor() as cr:
+                    cr.execute("SELECT id FROM users WHERE LOWER(email)=LOWER(%s) LIMIT 1", (q_email,))
+                    r = cr.fetchone()
+                    if r:
+                        resolved_id = int(r.get('id'))
+                conn_r.close()
+            except Exception:
+                try:
+                    conn_r.close()
+                except Exception:
+                    pass
+
+        if resolved_id is None:
+            return jsonify({"status": "success", "data": []})
+
+        # In-memory tasks: include only those uploaded by this user
+        memory_data = []
+        for task_id, payload in completed_unconfirmed_tasks.items():
+            try:
+                if int(payload.get('uploaded_by') or -1) != int(resolved_id):
+                    continue
+            except Exception:
+                continue
+            item = {"task_id": task_id, **payload}
+            # ensure filename is set for UI
+            if payload.get('display_name'):
+                item['filename'] = payload.get('display_name')
+            memory_data.append(item)
+
+        # DB-backed staged tasks: strictly filter by uploader
         db_data = []
         try:
             conn = get_mysql_connection()
             with conn.cursor() as cursor:
-                # Resolve user from email if provided
-                resolved_id = None
-                if q_email and not q_user_id:
-                    cursor.execute("SELECT id FROM users WHERE LOWER(email)=LOWER(%s) LIMIT 1", (q_email,))
-                    r = cursor.fetchone()
-                    resolved_id = int(r['id']) if r else None
-                elif q_user_id:
-                    try:
-                        resolved_id = int(q_user_id)
-                    except Exception:
-                        resolved_id = None
-
-                base_sql = (
+                cursor.execute(
                     """
                     SELECT uf.FileID AS file_id,
                            uf.FileName AS file_name,
                            DATE_FORMAT(CONVERT_TZ(uf.UploadDatetime, @@session.time_zone, '+00:00'), '%Y-%m-%dT%H:%i:%sZ') AS uploaded_at
                     FROM UploadFiles uf
                     WHERE COALESCE(uf.Confirmed, 'Unconfirmed') = 'Unconfirmed'
-                    {USER_FILTER}
+                      AND uf.uploaded_by = %s
                     ORDER BY uf.UploadDatetime DESC
-                    """
+                    """,
+                    (resolved_id,)
                 )
-                if resolved_id is not None:
-                    sql = base_sql.replace('{USER_FILTER}', 'AND uf.uploaded_by = %s')
-                    cursor.execute(sql, (resolved_id,))
-                else:
-                    sql = base_sql.replace('{USER_FILTER}', '')
-                    cursor.execute(sql)
                 rows = cursor.fetchall()
                 for r in rows:
                     db_data.append({
@@ -426,12 +441,13 @@ def create_app() -> Flask:
             except Exception:
                 pass
 
-        # Merge memory first (newer tasks), then DB-backed staged items
-        # Avoid duplicates: if memory contains a task with this file_id, skip DB one
+        # Prefer in-memory (newer), then DB, dedup by file id
         try:
             memory_file_ids = set()
             for _, payload in completed_unconfirmed_tasks.items():
                 try:
+                    if int(payload.get('uploaded_by') or -1) != int(resolved_id):
+                        continue
                     if payload.get('file_id') is not None:
                         memory_file_ids.add(int(payload.get('file_id')))
                 except Exception:
