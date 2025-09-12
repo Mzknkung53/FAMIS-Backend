@@ -370,7 +370,7 @@ def create_app() -> Flask:
         for task_id, payload in completed_unconfirmed_tasks.items():
             item = {"task_id": task_id, **payload}
             if payload.get('display_name'):
-                item['filename'] = payload.get('display_name')
+                item['display_name'] = payload['display_name']
             memory_data.append(item)
 
         # DB-backed staged tasks (persist across restarts)
