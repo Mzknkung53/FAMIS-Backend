@@ -17,7 +17,10 @@ def background_process(task_id, file_bytes, filename, user_id=None, user_email=N
         job_store[task_id] = {
             "status": "processing",
             "message": f"{filename} is being processed.",
-            "timestamp": utc_now_iso()
+            "timestamp": utc_now_iso(),
+            # Best-effort early linkage for debugging; finalized after uploader resolution
+            "uploaded_by": None,
+            "uploader_email": user_email,
         }
 
         import tempfile
@@ -82,6 +85,16 @@ def background_process(task_id, file_bytes, filename, user_id=None, user_email=N
             }
             return
 
+        # Update processing job with resolved uploader info
+        try:
+            job = job_store.get(task_id) or {}
+            job["uploaded_by"] = uploader_id
+            if user_email:
+                job["uploader_email"] = user_email
+            job_store[task_id] = job
+        except Exception:
+            pass
+
         try:
             conn = get_mysql_connection()
             with conn.cursor() as cursor:
@@ -103,6 +116,14 @@ def background_process(task_id, file_bytes, filename, user_id=None, user_email=N
                 conn.close()
             except Exception:
                 pass
+
+        # Attach file_id to the processing job so the task-board can hide DB rows while processing
+        try:
+            job = job_store.get(task_id) or {}
+            job["file_id"] = file_id
+            job_store[task_id] = job
+        except Exception:
+            pass
 
         # Notify: OCR processing started
         try:
@@ -211,7 +232,9 @@ def background_process(task_id, file_bytes, filename, user_id=None, user_email=N
             "file_base64": encoded_pdf,
             "filename": filename,
             "display_name": display_name,
-            "file_id": file_id
+            "file_id": file_id,
+            "uploaded_by": uploader_id,
+            "uploader_email": user_email,
         }
         completed_unconfirmed_tasks[task_id] = job_store[task_id]
 

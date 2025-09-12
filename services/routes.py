@@ -358,7 +358,9 @@ def create_app() -> Flask:
                 "file_base64": job["file_base64"],
                 "filename": job["filename"],
                 "display_name": job.get("display_name"),
-                "file_id": job.get("file_id")
+                "file_id": job.get("file_id"),
+                "uploaded_by": job.get("uploaded_by"),
+                "uploader_email": job.get("uploader_email"),
             })
 
         return jsonify(job)
@@ -392,10 +394,14 @@ def create_app() -> Flask:
                     pass
 
         if resolved_id is None:
+            print(f"[TaskBoard] No resolved user. q_user_id={q_user_id!r}, q_email={q_email!r}")
             return jsonify({"status": "success", "data": []})
 
+        print(f"[TaskBoard] incoming params -> user_id={q_user_id!r}, email={q_email!r}")
         # In-memory tasks: include only those uploaded by this user
         memory_data = []
+        _mem_ids = []
+        _mem_file_ids = []
         for task_id, payload in completed_unconfirmed_tasks.items():
             try:
                 if int(payload.get('uploaded_by') or -1) != int(resolved_id):
@@ -407,25 +413,86 @@ def create_app() -> Flask:
             if payload.get('display_name'):
                 item['filename'] = payload.get('display_name')
             memory_data.append(item)
+            _mem_ids.append(task_id)
+            try:
+                if payload.get('file_id') is not None:
+                    _mem_file_ids.append(int(payload.get('file_id')))
+            except Exception:
+                pass
 
         # DB-backed staged tasks: strictly filter by uploader
         db_data = []
+        _db_count_check = None
+        _db_list_errors = []
         try:
             conn = get_mysql_connection()
             with conn.cursor() as cursor:
-                cursor.execute(
-                    """
-                    SELECT uf.FileID AS file_id,
-                           uf.FileName AS file_name,
-                           DATE_FORMAT(CONVERT_TZ(uf.UploadDatetime, @@session.time_zone, '+00:00'), '%Y-%m-%dT%H:%i:%sZ') AS uploaded_at
-                    FROM UploadFiles uf
-                    WHERE COALESCE(uf.Confirmed, 'Unconfirmed') = 'Unconfirmed'
-                      AND uf.uploaded_by = %s
-                    ORDER BY uf.UploadDatetime DESC
-                    """,
-                    (resolved_id,)
-                )
-                rows = cursor.fetchall()
+                # First, compute an internal count to compare with /task-board/count
+                try:
+                    cursor.execute(
+                        """
+                        SELECT COUNT(*) AS c
+                        FROM UploadFiles uf
+                        WHERE (uf.Confirmed = 'Unconfirmed' OR uf.Confirmed IS NULL OR LOWER(uf.Confirmed)='unconfirmed')
+                          AND uf.uploaded_by = %s
+                        """,
+                        (resolved_id,)
+                    )
+                    rcount = cursor.fetchone()
+                    _db_count_check = int(rcount.get('c') or 0) if rcount else 0
+                except Exception:
+                    _db_count_check = None
+                # Try list queries in sequence, catching errors without aborting
+                rows = []
+                list_queries = [
+                    (
+                        "SELECT uf.FileID AS file_id, uf.FileName AS file_name, "
+                        "DATE_FORMAT(CONVERT_TZ(uf.UploadDatetime, @@session.time_zone, '+00:00'), '%Y-%m-%dT%H:%i:%sZ') AS uploaded_at "
+                        "FROM UploadFiles uf WHERE COALESCE(uf.Confirmed, 'Unconfirmed') = 'Unconfirmed' AND uf.uploaded_by = %s "
+                        "ORDER BY uf.UploadDatetime DESC"
+                    ),
+                    (
+                        "SELECT uf.FileID AS file_id, uf.FileName AS file_name, "
+                        "DATE_FORMAT(CONVERT_TZ(uf.UploadDatetime, @@session.time_zone, '+00:00'), '%Y-%m-%dT%H:%i:%sZ') AS uploaded_at "
+                        "FROM uploadfiles uf WHERE COALESCE(uf.Confirmed, 'Unconfirmed') = 'Unconfirmed' AND uf.uploaded_by = %s "
+                        "ORDER BY uf.UploadDatetime DESC"
+                    ),
+                    (
+                        "SELECT uf.FileID AS file_id, uf.FileName AS file_name, "
+                        "DATE_FORMAT(uf.UploadDatetime, '%Y-%m-%dT%H:%i:%sZ') AS uploaded_at "
+                        "FROM UploadFiles uf WHERE (uf.Confirmed = 'Unconfirmed' OR uf.Confirmed IS NULL OR LOWER(uf.Confirmed)='unconfirmed') AND uf.uploaded_by = %s "
+                        "ORDER BY uf.UploadDatetime DESC"
+                    ),
+                    (
+                        "SELECT uf.FileID AS file_id, uf.FileName AS file_name, "
+                        "DATE_FORMAT(uf.UploadDatetime, '%Y-%m-%dT%H:%i:%sZ') AS uploaded_at "
+                        "FROM uploadfiles uf WHERE (uf.Confirmed = 'Unconfirmed' OR uf.Confirmed IS NULL OR LOWER(uf.Confirmed)='unconfirmed') AND uf.uploaded_by = %s "
+                        "ORDER BY uf.UploadDatetime DESC"
+                    ),
+                    (
+                        "SELECT uf.FileID AS file_id, uf.FileName AS file_name, NOW() AS uploaded_at "
+                        "FROM UploadFiles uf WHERE (uf.Confirmed = 'Unconfirmed' OR uf.Confirmed IS NULL OR LOWER(uf.Confirmed)='unconfirmed') AND uf.uploaded_by = %s "
+                        "ORDER BY uf.FileID DESC"
+                    ),
+                    (
+                        "SELECT uf.FileID AS file_id, uf.FileName AS file_name, NOW() AS uploaded_at "
+                        "FROM uploadfiles uf WHERE (uf.Confirmed = 'Unconfirmed' OR uf.Confirmed IS NULL OR LOWER(uf.Confirmed)='unconfirmed') AND uf.uploaded_by = %s "
+                        "ORDER BY uf.FileID DESC"
+                    ),
+                ]
+                for sql in list_queries:
+                    try:
+                        cursor.execute(sql, (resolved_id,))
+                        tmp = cursor.fetchall() or []
+                        if tmp:
+                            rows = tmp
+                            break
+                    except Exception as _e:
+                        try:
+                            _db_list_errors.append(str(_e))
+                        except Exception:
+                            pass
+                _db_file_ids_dbg = []
                 for r in rows:
                     db_data.append({
                         "task_id": f"file:{int(r['file_id'])}",
@@ -434,6 +501,68 @@ def create_app() -> Flask:
                         "timestamp": r.get('uploaded_at'),
                         "filename": r.get('file_name')
                     })
+                    try:
+                        _db_file_ids_dbg.append(int(r['file_id']))
+                    except Exception:
+                        pass
+
+                # Last-chance fallback: if our internal count indicates rows exist but list-query returned 0,
+                # fetch by uploaded_by without Confirmed filter and filter in Python.
+                if (not db_data) and (_db_count_check is not None) and (_db_count_check > 0):
+                    try:
+                        cursor.execute(
+                            """
+                            SELECT uf.FileID AS file_id,
+                                   uf.FileName AS file_name,
+                                   uf.UploadDatetime AS uploaded_at,
+                                   uf.Confirmed AS confirmed
+                            FROM UploadFiles uf
+                            WHERE uf.uploaded_by = %s
+                            ORDER BY uf.UploadDatetime DESC
+                            LIMIT 500
+                            """,
+                            (resolved_id,)
+                        )
+                        rows_fallback = cursor.fetchall() or []
+                    except Exception:
+                        rows_fallback = []
+                    if not rows_fallback:
+                        try:
+                            cursor.execute(
+                                """
+                                SELECT uf.FileID AS file_id,
+                                       uf.FileName AS file_name,
+                                       uf.UploadDatetime AS uploaded_at,
+                                       uf.Confirmed AS confirmed
+                                FROM uploadfiles uf
+                                WHERE uf.uploaded_by = %s
+                                ORDER BY uf.UploadDatetime DESC
+                                LIMIT 500
+                                """,
+                                (resolved_id,)
+                            )
+                            rows_fallback = cursor.fetchall() or []
+                        except Exception:
+                            rows_fallback = []
+                    for r in rows_fallback:
+                        try:
+                            conf_val = r.get('confirmed') if 'confirmed' in r else r.get('Confirmed')
+                            include = (conf_val is None) or (str(conf_val).strip().lower() == 'unconfirmed')
+                        except Exception:
+                            include = False
+                        if not include:
+                            continue
+                        db_data.append({
+                            "task_id": f"file:{int(r['file_id'])}",
+                            "status": "complete",
+                            "message": "This file is processed and waiting for confirmation.",
+                            "timestamp": r.get('uploaded_at'),
+                            "filename": r.get('file_name')
+                        })
+                        try:
+                            _db_file_ids_dbg.append(int(r['file_id']))
+                        except Exception:
+                            pass
             conn.close()
         except Exception:
             try:
@@ -441,7 +570,7 @@ def create_app() -> Flask:
             except Exception:
                 pass
 
-        # Prefer in-memory (newer), then DB, dedup by file id
+        # Prefer in-memory (newer), then DB, dedup by file id and hide in-progress uploads
         try:
             memory_file_ids = set()
             for _, payload in completed_unconfirmed_tasks.items():
@@ -452,12 +581,26 @@ def create_app() -> Flask:
                         memory_file_ids.add(int(payload.get('file_id')))
                 except Exception:
                     pass
+
+            # Exclude DB rows that are currently processing for this user
+            processing_file_ids = set()
+            try:
+                for _, j in job_store.items():
+                    try:
+                        if int(j.get('uploaded_by') or -1) != int(resolved_id):
+                            continue
+                        if j.get('status') != 'complete' and j.get('file_id') is not None:
+                            processing_file_ids.add(int(j.get('file_id')))
+                    except Exception:
+                        continue
+            except Exception:
+                processing_file_ids = set()
             deduped_db = []
             for item in db_data:
                 try:
                     if isinstance(item.get('task_id'), str) and item['task_id'].startswith('file:'):
                         fid = int(item['task_id'].split(':',1)[1])
-                        if fid in memory_file_ids:
+                        if fid in memory_file_ids or fid in processing_file_ids:
                             continue
                 except Exception:
                     pass
@@ -465,7 +608,123 @@ def create_app() -> Flask:
             data = memory_data + deduped_db
         except Exception:
             data = memory_data + db_data
+
+        # Debug logging (no response change unless debug=1)
+        try:
+            print(
+                f"[TaskBoard] resolved_id={resolved_id} | memory={len(memory_data)} ids={_mem_ids} mem_file_ids={_mem_file_ids} | db={len(db_data)} db_file_ids={_db_file_ids_dbg if '_db_file_ids_dbg' in locals() else []} | count_check={_db_count_check} | deduped_db={len(deduped_db) if 'deduped_db' in locals() else len(db_data)} | total={len(data)}"
+            )
+        except Exception:
+            pass
+
+        if (request.args.get('debug') or '0') in ('1','true','yes'):
+            return jsonify({
+                "status": "success",
+                "data": data,
+                "debug": {
+                    "resolved_id": resolved_id,
+                    "memory_count": len(memory_data),
+                    "memory_task_ids": _mem_ids,
+                    "memory_file_ids": _mem_file_ids,
+                    "db_count": len(db_data),
+                    "db_file_ids": _db_file_ids_dbg if '_db_file_ids_dbg' in locals() else [],
+                    "db_count_check": _db_count_check,
+                    "db_list_errors": _db_list_errors,
+                    "deduped_db_count": len(deduped_db) if 'deduped_db' in locals() else len(db_data),
+                    "total": len(data)
+                }
+            })
+
         return jsonify({"status": "success", "data": data})
+
+    @app.route("/task-board/count", methods=["GET"])
+    def get_pending_task_count_for_user():
+        # Same resolution logic as /task-board
+        q_user_id = request.args.get('user_id')
+        q_email = request.args.get('email')
+
+        resolved_id = None
+        try:
+            if q_user_id is not None:
+                resolved_id = int(q_user_id)
+        except Exception:
+            resolved_id = None
+
+        if resolved_id is None and q_email:
+            try:
+                conn_r = get_mysql_connection()
+                with conn_r.cursor() as cr:
+                    cr.execute("SELECT id FROM users WHERE LOWER(email)=LOWER(%s) LIMIT 1", (q_email,))
+                    r = cr.fetchone()
+                    if r:
+                        resolved_id = int(r.get('id'))
+                conn_r.close()
+            except Exception:
+                try:
+                    conn_r.close()
+                except Exception:
+                    pass
+
+        if resolved_id is None:
+            print(f"[TaskBoardCount] No resolved user. q_user_id={q_user_id!r}, q_email={q_email!r}")
+            return jsonify({"status": "success", "count": 0})
+
+        memory_count = 0
+        try:
+            for _, payload in completed_unconfirmed_tasks.items():
+                try:
+                    if int(payload.get('uploaded_by') or -1) != int(resolved_id):
+                        continue
+                    memory_count += 1
+                except Exception:
+                    continue
+        except Exception:
+            memory_count = 0
+
+        db_count = 0
+        try:
+            conn = get_mysql_connection()
+            with conn.cursor() as cursor:
+                cursor.execute(
+                    """
+                    SELECT COUNT(*) AS c
+                    FROM UploadFiles uf
+                    WHERE COALESCE(uf.Confirmed, 'Unconfirmed') = 'Unconfirmed'
+                      AND uf.uploaded_by = %s
+                    """,
+                    (resolved_id,)
+                )
+                row = cursor.fetchone()
+                db_count = int(row.get('c') or 0) if row else 0
+                if db_count == 0:
+                    try:
+                        cursor.execute(
+                            """
+                            SELECT COUNT(*) AS c
+                            FROM uploadfiles uf
+                            WHERE COALESCE(uf.Confirmed, 'Unconfirmed') = 'Unconfirmed'
+                              AND uf.uploaded_by = %s
+                            """,
+                            (resolved_id,)
+                        )
+                        row2 = cursor.fetchone()
+                        db_count = int(row2.get('c') or 0) if row2 else 0
+                    except Exception:
+                        pass
+            conn.close()
+        except Exception:
+            try:
+                conn.close()
+            except Exception:
+                pass
+            db_count = 0
+
+        total = int(memory_count) + int(db_count)
+        try:
+            print(f"[TaskBoardCount] resolved_id={resolved_id} | memory={memory_count} | db={db_count} | total={total}")
+        except Exception:
+            pass
+        return jsonify({"status": "success", "count": total})
 
     @app.route("/task-result/<task_id>", methods=["GET"])
     def get_task_result_details(task_id):
