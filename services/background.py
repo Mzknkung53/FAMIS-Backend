@@ -194,7 +194,53 @@ def background_process(task_id, file_bytes, filename, user_id=None, user_email=N
         except Exception:
             pass
 
-        # No staging write. Extracted data will be persisted on staff confirmation (/save).
+        # Persist extracted data immediately so it can be viewed later (even after server restarts)
+        try:
+            conn = get_mysql_connection()
+            with conn.cursor() as cursor:
+                # Ensure any old rows are cleared (should normally be none for a new upload)
+                try:
+                    cursor.execute("DELETE FROM ExtractedData WHERE FileID=%s", (file_id,))
+                except Exception:
+                    pass
+
+                insert_sql = (
+                    """
+                    INSERT INTO ExtractedData
+                    (FileID, BillNumber, Amount, SupplierName, PaymentDate, Signature, DocTypeID, PageNumber, ExtractedAt, FilePath)
+                    VALUES (%s,%s,%s,%s,%s,%s,%s,%s,NOW(),%s)
+                    """
+                )
+
+                for doc in interpreted_data:
+                    raw_amt = doc.get("amount")
+                    try:
+                        amt_val = float(str(raw_amt).replace(",", "")) if raw_amt is not None else None
+                    except Exception:
+                        amt_val = None
+                    doc_type_id = resolve_doc_type_id(doc.get("document_type"))
+                    cursor.execute(
+                        insert_sql,
+                        (
+                            file_id,
+                            doc.get("bill_number"),
+                            amt_val,
+                            doc.get("supplier_name"),
+                            doc.get("payment_date"),
+                            doc.get("signature"),
+                            doc_type_id,
+                            int(doc.get("page") or 1),
+                            saved_file_path,
+                        ),
+                    )
+            conn.commit()
+            conn.close()
+        except Exception:
+            try:
+                conn.rollback()
+                conn.close()
+            except Exception:
+                pass
 
         # Notify: extraction completed successfully
         try:

@@ -824,6 +824,45 @@ def create_app() -> Flask:
         try:
             conn = get_mysql_connection()
             with conn.cursor() as cursor:
+                # Safety: if ExtractedData is empty for this file, try to persist from task.result before confirming
+                try:
+                    cursor.execute("SELECT COUNT(*) AS c FROM ExtractedData WHERE FileID=%s", (file_id,))
+                    rowc = cursor.fetchone()
+                    missing = (int(rowc.get('c') or 0) == 0) if rowc else True
+                except Exception:
+                    missing = False
+                if missing:
+                    try:
+                        insert_sql = (
+                            """
+                            INSERT INTO ExtractedData
+                            (FileID, BillNumber, Amount, SupplierName, PaymentDate, Signature, DocTypeID, PageNumber, ExtractedAt, FilePath)
+                            VALUES (%s,%s,%s,%s,%s,%s,%s,%s,NOW(),%s)
+                            """
+                        )
+                        for doc in (task.get('result') or []):
+                            raw_amt = doc.get("amount")
+                            try:
+                                amt_val = float(str(raw_amt).replace(",", "")) if raw_amt is not None else None
+                            except Exception:
+                                amt_val = None
+                            doc_type_id = resolve_doc_type_id(doc.get("document_type"))
+                            cursor.execute(
+                                insert_sql,
+                                (
+                                    file_id,
+                                    doc.get("bill_number"),
+                                    amt_val,
+                                    doc.get("supplier_name"),
+                                    doc.get("payment_date"),
+                                    doc.get("signature"),
+                                    doc_type_id,
+                                    int(doc.get("page") or 1),
+                                    task.get('file_path') or None,
+                                ),
+                            )
+                    except Exception:
+                        pass
                 # Resolve reviewer id from email if provided
                 if reviewer_id is None and reviewer_email:
                     cursor.execute("SELECT id FROM users WHERE LOWER(email)=LOWER(%s) LIMIT 1", (reviewer_email,))
