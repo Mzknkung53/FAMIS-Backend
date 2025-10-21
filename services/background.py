@@ -38,7 +38,7 @@ def background_process(task_id, file_bytes, filename, user_id=None, user_email=N
                 "message": result["message"],
                 "timestamp": utc_now_iso()
             }
-            print(f"---- Upload and validation done for {filename} ----")
+            print(f"✗ [ERROR] Upload validation failed: {filename} - {result['message']}")
             return
 
         uploader_id = None
@@ -296,7 +296,9 @@ def background_process(task_id, file_bytes, filename, user_id=None, user_email=N
         }
         completed_unconfirmed_tasks[task_id] = job_store[task_id]
 
-        print(f"---- Background job finished for task_id: {task_id} ----")
+        print(f"✓ [COMPLETE] File processed: {filename} (task_id: {task_id})")
+        print(f"  - Pages extracted: {len(interpreted_data)}")
+        print(f"  - File ID: {file_id}")
 
     except Exception as e:
         traceback.print_exc()
@@ -305,6 +307,6 @@ def background_process(task_id, file_bytes, filename, user_id=None, user_email=N
             "message": f"Server error: {str(e)}",
             "timestamp": utc_now_iso()
         }
-        print(f"---- Exception in background_process: {e} ----")
+        print(f"✗ [EXCEPTION] Background process failed: {str(e)}")
 
 

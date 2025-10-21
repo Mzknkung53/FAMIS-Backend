@@ -322,13 +322,13 @@ def create_app() -> Flask:
             file_bytes = file_info['file_bytes']
             filename = file_info['filename']
             
-            print(f">>> Processing file sequentially: {filename} (task_id: {task_id})")
+            print(f"→ [QUEUE] Processing file: {filename} (task_id: {task_id})")
             
             try:
                 background_process(task_id, file_bytes, filename, user_id, user_email)
-                print(f">>> Completed processing: {filename}")
+                # Completed message handled in background_process
             except Exception as e:
-                print(f">>> Error processing {filename}: {str(e)}")
+                print(f"✗ [ERROR] Failed to process {filename}: {str(e)}")
                 job_store[task_id] = {
                     "status": "error",
                     "message": f"Failed to process file: {str(e)}"
@@ -336,12 +336,10 @@ def create_app() -> Flask:
 
     @app.route("/process", methods=["POST"])
     def process_file():
-        print(">>> /process endpoint called")
-        
         # Support both single file and multiple files
         # Check for 'files' (multiple) or 'file' (single)
         if "files" not in request.files and "file" not in request.files:
-            print(">>> No file part in request")
+            print("✗ [ERROR] No file in upload request")
             return jsonify({"status": "error", "message": "No file part"}), 400
 
         user_email = request.form.get("email")
@@ -353,7 +351,7 @@ def create_app() -> Flask:
         # Validate that at least one file is selected
         valid_files = [f for f in files if f.filename != ""]
         if not valid_files:
-            print(">>> No selected file")
+            print("✗ [ERROR] Empty file selection")
             return jsonify({"status": "error", "message": "No selected file"}), 400
 
         import uuid as _uuid
@@ -372,11 +370,11 @@ def create_app() -> Flask:
                 'filename': file.filename
             })
             task_ids.append(task_id)
-            print(f">>> Queued file: {file.filename} with task_id: {task_id}")
+            # Queuing message moved to sequential_background_process
 
         # Process files sequentially in a single background thread
         if len(files_data) > 1:
-            print(f">>> Starting sequential processing of {len(files_data)} files")
+            print(f"⇉ [BATCH] Processing {len(files_data)} files sequentially")
             thread = Thread(target=sequential_background_process, args=(files_data, user_id, user_email))
             thread.start()
         else:
@@ -924,7 +922,7 @@ def create_app() -> Flask:
             return jsonify({"status": "success"}), 200
 
         except Exception as e:
-            print("❌ Confirm Task Error:", e)
+            print(f"✗ [ERROR] Confirm task failed (file_id={file_id}): {str(e)}")
             return jsonify({"status": "error", "message": "Failed to store data. Please try again later."}), 500
 
     @app.route("/update", methods=["POST"])
