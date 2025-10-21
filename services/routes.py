@@ -315,36 +315,87 @@ def create_app() -> Flask:
         except Exception as e:
             return jsonify({"status": "error", "message": str(e)}), 500
 
+    def sequential_background_process(files_data, user_id, user_email):
+        """Process multiple files sequentially (one at a time) to avoid overloading the server"""
+        for file_info in files_data:
+            task_id = file_info['task_id']
+            file_bytes = file_info['file_bytes']
+            filename = file_info['filename']
+            
+            print(f">>> Processing file sequentially: {filename} (task_id: {task_id})")
+            
+            try:
+                background_process(task_id, file_bytes, filename, user_id, user_email)
+                print(f">>> Completed processing: {filename}")
+            except Exception as e:
+                print(f">>> Error processing {filename}: {str(e)}")
+                job_store[task_id] = {
+                    "status": "error",
+                    "message": f"Failed to process file: {str(e)}"
+                }
+
     @app.route("/process", methods=["POST"])
     def process_file():
         print(">>> /process endpoint called")
-        if "file" not in request.files:
+        
+        # Support both single file and multiple files
+        # Check for 'files' (multiple) or 'file' (single)
+        if "files" not in request.files and "file" not in request.files:
             print(">>> No file part in request")
             return jsonify({"status": "error", "message": "No file part"}), 400
 
-        file = request.files["file"]
-        if file.filename == "":
+        user_email = request.form.get("email")
+        user_id = request.form.get("user_id")
+        
+        # Get files list - supports both single and multiple files
+        files = request.files.getlist("files") if "files" in request.files else [request.files["file"]]
+        
+        # Validate that at least one file is selected
+        valid_files = [f for f in files if f.filename != ""]
+        if not valid_files:
             print(">>> No selected file")
             return jsonify({"status": "error", "message": "No selected file"}), 400
 
-        file_bytes = file.read()
-        user_email = request.form.get("email")
-        user_id = request.form.get("user_id")
         import uuid as _uuid
-        task_id = str(_uuid.uuid4())
-        job_store[task_id] = {"status": "processing"}
+        task_ids = []
+        files_data = []
+        
+        # Read all files and prepare data
+        for file in valid_files:
+            file_bytes = file.read()
+            task_id = str(_uuid.uuid4())
+            job_store[task_id] = {"status": "processing"}
+            
+            files_data.append({
+                'task_id': task_id,
+                'file_bytes': file_bytes,
+                'filename': file.filename
+            })
+            task_ids.append(task_id)
+            print(f">>> Queued file: {file.filename} with task_id: {task_id}")
 
-        thread = Thread(target=background_process, args=(task_id, file_bytes, file.filename, user_id, user_email))
-        thread.start()
+        # Process files sequentially in a single background thread
+        if len(files_data) > 1:
+            print(f">>> Starting sequential processing of {len(files_data)} files")
+            thread = Thread(target=sequential_background_process, args=(files_data, user_id, user_email))
+            thread.start()
+        else:
+            # Single file - use original method for backward compatibility
+            file_info = files_data[0]
+            thread = Thread(target=background_process, args=(file_info['task_id'], file_info['file_bytes'], file_info['filename'], user_id, user_email))
+            thread.start()
 
-        print(f">>> Started background thread with task_id: {task_id}")
-
-        return jsonify({"status": "submitted", "task_id": task_id})
+        # Return single task_id for backward compatibility, or array for multiple files
+        if len(task_ids) == 1:
+            return jsonify({"status": "submitted", "task_id": task_ids[0]})
+        else:
+            return jsonify({"status": "submitted", "task_ids": task_ids, "count": len(task_ids)})
 
     @app.route("/status/<task_id>", methods=["GET"])
     def get_task_status(task_id):
         job = job_store.get(task_id)
-        print(f"STATUS CHECK for {task_id}: {job}")
+        # Reduced logging - only log if job not found or has error
+        # print(f"STATUS CHECK for {task_id}: {job}")
 
         if not job:
             return jsonify({"status": "error", "message": "Task not found"}), 404
@@ -394,10 +445,10 @@ def create_app() -> Flask:
                     pass
 
         if resolved_id is None:
-            print(f"[TaskBoard] No resolved user. q_user_id={q_user_id!r}, q_email={q_email!r}")
+            # print(f"[TaskBoard] No resolved user. q_user_id={q_user_id!r}, q_email={q_email!r}")
             return jsonify({"status": "success", "data": []})
 
-        print(f"[TaskBoard] incoming params -> user_id={q_user_id!r}, email={q_email!r}")
+        # print(f"[TaskBoard] incoming params -> user_id={q_user_id!r}, email={q_email!r}")
         # In-memory tasks: include only those uploaded by this user
         memory_data = []
         _mem_ids = []
@@ -610,12 +661,13 @@ def create_app() -> Flask:
             data = memory_data + db_data
 
         # Debug logging (no response change unless debug=1)
-        try:
-            print(
-                f"[TaskBoard] resolved_id={resolved_id} | memory={len(memory_data)} ids={_mem_ids} mem_file_ids={_mem_file_ids} | db={len(db_data)} db_file_ids={_db_file_ids_dbg if '_db_file_ids_dbg' in locals() else []} | count_check={_db_count_check} | deduped_db={len(deduped_db) if 'deduped_db' in locals() else len(db_data)} | total={len(data)}"
-            )
-        except Exception:
-            pass
+        # Reduced logging - only show in debug mode
+        # try:
+        #     print(
+        #         f"[TaskBoard] resolved_id={resolved_id} | memory={len(memory_data)} ids={_mem_ids} mem_file_ids={_mem_file_ids} | db={len(db_data)} db_file_ids={_db_file_ids_dbg if '_db_file_ids_dbg' in locals() else []} | count_check={_db_count_check} | deduped_db={len(deduped_db) if 'deduped_db' in locals() else len(db_data)} | total={len(data)}"
+        #     )
+        # except Exception:
+        #     pass
 
         if (request.args.get('debug') or '0') in ('1','true','yes'):
             return jsonify({
@@ -666,7 +718,7 @@ def create_app() -> Flask:
                     pass
 
         if resolved_id is None:
-            print(f"[TaskBoardCount] No resolved user. q_user_id={q_user_id!r}, q_email={q_email!r}")
+            # print(f"[TaskBoardCount] No resolved user. q_user_id={q_user_id!r}, q_email={q_email!r}")
             return jsonify({"status": "success", "count": 0})
 
         memory_count = 0
@@ -720,10 +772,11 @@ def create_app() -> Flask:
             db_count = 0
 
         total = int(memory_count) + int(db_count)
-        try:
-            print(f"[TaskBoardCount] resolved_id={resolved_id} | memory={memory_count} | db={db_count} | total={total}")
-        except Exception:
-            pass
+        # Reduced logging
+        # try:
+        #     print(f"[TaskBoardCount] resolved_id={resolved_id} | memory={memory_count} | db={db_count} | total={total}")
+        # except Exception:
+        #     pass
         return jsonify({"status": "success", "count": total})
 
     @app.route("/task-result/<task_id>", methods=["GET"])
@@ -824,45 +877,9 @@ def create_app() -> Flask:
         try:
             conn = get_mysql_connection()
             with conn.cursor() as cursor:
-                # Safety: if ExtractedData is empty for this file, try to persist from task.result before confirming
-                try:
-                    cursor.execute("SELECT COUNT(*) AS c FROM ExtractedData WHERE FileID=%s", (file_id,))
-                    rowc = cursor.fetchone()
-                    missing = (int(rowc.get('c') or 0) == 0) if rowc else True
-                except Exception:
-                    missing = False
-                if missing:
-                    try:
-                        insert_sql = (
-                            """
-                            INSERT INTO ExtractedData
-                            (FileID, BillNumber, Amount, SupplierName, PaymentDate, Signature, DocTypeID, PageNumber, ExtractedAt, FilePath)
-                            VALUES (%s,%s,%s,%s,%s,%s,%s,%s,NOW(),%s)
-                            """
-                        )
-                        for doc in (task.get('result') or []):
-                            raw_amt = doc.get("amount")
-                            try:
-                                amt_val = float(str(raw_amt).replace(",", "")) if raw_amt is not None else None
-                            except Exception:
-                                amt_val = None
-                            doc_type_id = resolve_doc_type_id(doc.get("document_type"))
-                            cursor.execute(
-                                insert_sql,
-                                (
-                                    file_id,
-                                    doc.get("bill_number"),
-                                    amt_val,
-                                    doc.get("supplier_name"),
-                                    doc.get("payment_date"),
-                                    doc.get("signature"),
-                                    doc_type_id,
-                                    int(doc.get("page") or 1),
-                                    task.get('file_path') or None,
-                                ),
-                            )
-                    except Exception:
-                        pass
+                # Note: ExtractedData is already persisted in background_process, so no need to insert again
+                # This prevents duplicate data insertion when confirm is called
+                
                 # Resolve reviewer id from email if provided
                 if reviewer_id is None and reviewer_email:
                     cursor.execute("SELECT id FROM users WHERE LOWER(email)=LOWER(%s) LIMIT 1", (reviewer_email,))
@@ -986,7 +1003,7 @@ def create_app() -> Flask:
         if not (filename and image_path and isinstance(structured_data, list)):
             return jsonify({"status": "error", "message": "Missing or invalid keys"}), 400
 
-        print(f"/save: payload -> user_id={user_id}, email={user_email}, filename={filename}")
+        # print(f"/save: payload -> user_id={user_id}, email={user_email}, filename={filename}")
 
         try:
             conn = get_mysql_connection()
@@ -1022,7 +1039,7 @@ def create_app() -> Flask:
                 return jsonify({"status": "error", "message": "Uploader mismatch"}), 400
 
             uploader_id = int(resolved.get("id"))
-            print(f"/save: verified uploader -> id={uploader_id}, email={resolved.get('email')}, role={resolved.get('role')}")
+            # print(f"/save: verified uploader -> id={uploader_id}, email={resolved.get('email')}, role={resolved.get('role')}")
         except Exception as e:
             return jsonify({"status": "error", "message": f"Uploader verification failed: {e}"}), 500
 
@@ -1037,7 +1054,7 @@ def create_app() -> Flask:
             return jsonify({"status": "error", "message": "Uploader mismatch"}), 400
 
         uploader_id = int(resolved.get("id"))
-        print(f"/save: verified uploader -> id={uploader_id}, email={resolved.get('email')}, role={resolved.get('role')}")
+        # print(f"/save: verified uploader -> id={uploader_id}, email={resolved.get('email')}, role={resolved.get('role')}")
 
         try:
             saved_file_path = None
@@ -1099,7 +1116,7 @@ def create_app() -> Flask:
                         )
                     )
                     file_id = cursor.lastrowid
-                    print(f"/save: created uploadfiles row -> FileID={file_id}, uploaded_by={uploader_id}")
+                    # print(f"/save: created uploadfiles row -> FileID={file_id}, uploaded_by={uploader_id}")
 
                 # Replace ExtractedData rows for this file
                 cursor.execute("DELETE FROM ExtractedData WHERE FileID=%s", (file_id,))

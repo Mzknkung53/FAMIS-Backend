@@ -213,11 +213,23 @@ def background_process(task_id, file_bytes, filename, user_id=None, user_email=N
                 )
 
                 for doc in interpreted_data:
+                    # Amount is already normalized to format like "20000.00"
                     raw_amt = doc.get("amount")
                     try:
-                        amt_val = float(str(raw_amt).replace(",", "")) if raw_amt is not None else None
+                        # Convert to Decimal for database storage (preserves .00)
+                        from decimal import Decimal
+                        if raw_amt is not None:
+                            # Remove commas if any and convert
+                            amt_str = str(raw_amt).replace(",", "")
+                            amt_val = Decimal(amt_str)
+                        else:
+                            amt_val = None
                     except Exception:
                         amt_val = None
+                    
+                    # Date is already normalized to format like "02 พฤษภาคม 2568"
+                    payment_date = doc.get("payment_date")
+                    
                     doc_type_id = resolve_doc_type_id(doc.get("document_type"))
                     cursor.execute(
                         insert_sql,
@@ -226,7 +238,7 @@ def background_process(task_id, file_bytes, filename, user_id=None, user_email=N
                             doc.get("bill_number"),
                             amt_val,
                             doc.get("supplier_name"),
-                            doc.get("payment_date"),
+                            payment_date,
                             doc.get("signature"),
                             doc_type_id,
                             int(doc.get("page") or 1),

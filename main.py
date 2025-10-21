@@ -1,7 +1,13 @@
 from services.routes import create_app
+import logging
 
 
 app = create_app()
+
+# Reduce Flask/Werkzeug logging noise from polling requests
+# Only show warnings and errors, not every request
+log = logging.getLogger('werkzeug')
+log.setLevel(logging.WARNING)
 
 
 if __name__ == "__main__":
