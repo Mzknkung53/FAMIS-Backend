@@ -1,6 +1,5 @@
 import json
 import re
-from concurrent.futures import ThreadPoolExecutor, as_completed
 
 from .ai_client import client
 
@@ -167,7 +166,7 @@ def extract_financial_data(ocr_text: str) -> list | dict:
 
     def extract_fields_page(args: tuple[int, str]) -> dict | None:
         idx, page_text = args
-        # Removed per-page logging for cleaner output
+        print(f"[EXTRACT] Extracting from Page {idx}...")
         result = extract_fields(page_text)
         if not isinstance(result, dict) or result.get("status") == "error":
             print(f"[WARN] Page {idx} extraction error: {result.get('message', 'unknown')}")
@@ -205,8 +204,11 @@ def extract_financial_data(ocr_text: str) -> list | dict:
         print(f"[WARN] {msg['message']}")
         return msg
 
-    # Log summary only, not full data
-    print(f"✓ [EXTRACT] Successfully extracted {len(all_results)} page(s) of financial data")
+    print(f"\n✅ Extracted {len(all_results)} page(s) successfully")
+    # Optional: uncomment to see detailed output
+    # for receipt in all_results:
+    #     import json as _json
+    #     print(_json.dumps(receipt, ensure_ascii=False, indent=2))
 
     return all_results
 
